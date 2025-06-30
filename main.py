@@ -47,6 +47,8 @@ def main():
             quantizers = gptq_utils.rtn_fwrd(model, utils.DEV, args)
         save_dict["w_quantizers"] = quantizers
 
+    flat_utils.save_quantized_weights(args, model, quantizers)
+
     if args.distribute_model:
         utils.distribute_model(model)
     else:

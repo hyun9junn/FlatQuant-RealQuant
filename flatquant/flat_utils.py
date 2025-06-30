@@ -92,4 +92,33 @@ def load_flat_matrices(args, model, path=None):
         layers[i].load_state_dict(flat_param, strict=False)
     return model
 
+## save int8
+def save_quantized_weights(args, model, quantizers):
+    state_dict = {}
+    
+    for name, param in model.named_parameters():
+        if name.endswith('.weight') or name.endswith('.bias'):
+            layer_name = name.rsplit('.', 1)[0]
+        else:
+            layer_name = name
+            
+        is_quantized = layer_name in quantizers
+        
+        if is_quantized and 'weight' in name:
+            state_dict[name] = param.to(torch.int8)
+        else:
+            state_dict[name] = param.half()
+
+    quantized_weights_path = os.path.join(args.exp_dir, f"quantized_weights.pth")
+
+    torch.save({
+        'model_state_dict': state_dict,
+        'quantizers': quantizers,
+        'config': {
+            'w_bits': args.w_bits,
+            'model_name': args.model
+        }
+    }, quantized_weights_path)
+    logging.info("saved weights at {}".format(quantized_weights_path))
+
 
