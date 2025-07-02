@@ -93,8 +93,13 @@ def load_flat_matrices(args, model, path=None):
     return model
 
 ## save int8
-def save_quantized_weights(args, model, quantizers, asym = False):
+def save_quantized_weights(args, model, quantizers, sym = True):
+
+    from flatquant.int4packer import INT4Packer
+    packer = INT4Packer()
+
     state_dict = {}
+    origin_shape = {}
     
     for name, param in model.named_parameters():
         if name.endswith('.weight') or name.endswith('.bias'):
@@ -113,12 +118,13 @@ def save_quantized_weights(args, model, quantizers, asym = False):
             zero = zero.to(param.device)
             maxq = maxq.to(param.device)
 
-            if asym:
-                param_quant = torch.clamp((param / scale).round() + zero, 0, maxq)
-            else:
+            if sym:
                 param_quant = torch.clamp((param / scale).round(), -(maxq + 1), maxq)
+            else:
+                param_quant = torch.clamp((param / scale).round() + zero, 0, maxq)
             
-            state_dict[name] = param_quant.to(torch.int8)
+            param_quant_int8 = param_quant.to(torch.int8)
+            state_dict[name], origin_shape[name] = packer.pack_int4_weight(param_quant_int8, sym = sym)
         else:
             state_dict[name] = param
 
@@ -126,6 +132,7 @@ def save_quantized_weights(args, model, quantizers, asym = False):
 
     torch.save({
         'model_state_dict': state_dict,
+        'origin_shape' : origin_shape,
         'quantizers': quantizers,
         'config': {
             'w_bits': args.w_bits,
