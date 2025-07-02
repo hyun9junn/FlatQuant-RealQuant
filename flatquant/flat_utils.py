@@ -93,7 +93,7 @@ def load_flat_matrices(args, model, path=None):
     return model
 
 ## save int8
-def save_quantized_weights(args, model, quantizers):
+def save_quantized_weights(args, model, quantizers, asym = False):
     state_dict = {}
     
     for name, param in model.named_parameters():
@@ -105,9 +105,22 @@ def save_quantized_weights(args, model, quantizers):
         is_quantized = layer_name in quantizers
         
         if is_quantized and 'weight' in name:
-            state_dict[name] = param.to(torch.int8)
+            scale = quantizers[layer_name].scale
+            maxq = quantizers[layer_name].maxq
+            zero = quantizers[layer_name].zero
+            
+            scale = scale.to(param.device)
+            zero = zero.to(param.device)
+            maxq = maxq.to(param.device)
+
+            if asym:
+                param_quant = torch.clamp((param / scale).round() + zero, 0, maxq)
+            else:
+                param_quant = torch.clamp((param / scale).round(), -(maxq + 1), maxq)
+            
+            state_dict[name] = param_quant.to(torch.int8)
         else:
-            state_dict[name] = param.half()
+            state_dict[name] = param
 
     quantized_weights_path = os.path.join(args.exp_dir, f"quantized_weights.pth")
 
