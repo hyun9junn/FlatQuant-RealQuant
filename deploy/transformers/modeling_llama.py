@@ -159,6 +159,9 @@ class FlatQuantFP16LlamaForCausalLM(LlamaForCausalLM):
         if args is not None:
             self.trans = args.trans
             self.online_trans = args.online_trans
+        else:
+            self.trans = "none"
+            self.online_trans = set()
         
     def build_cache(self, batch_size, page_size, max_length):
         device = self.model.layers[0].self_attn.v_proj.weight.device

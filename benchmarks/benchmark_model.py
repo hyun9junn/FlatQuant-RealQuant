@@ -5,14 +5,14 @@ import numpy as np
 import torch
 import time
 
-from e2e.quantized_llama import modeling_llama
+import deploy.transformers.modeling_llama as modeling_llama
 import torch
 import transformers
 
 model_configs = [
-    "meta-llama/Llama-2-7b-hf",
-    # "meta-llama/Llama-2-13b-hf", 
-    # "meta-llama/Llama-2-70b-hf", 
+    "./modelzoo/llama-2/llama-2-7b",
+    # "./modelzoo/llama-2-13b",
+    #"./modelzoo/llama-3/llama-3-8b", 
 ]
 
 benchmark_dtypes = ["int4", torch.float16]
@@ -55,7 +55,7 @@ def module_benchmark(module):
     return (end_time - start_time) * 1000 / num_bench_steps, peak_memory
 
 
-def get_model_quantized_quarot(config_name):
+def get_model_quantized(args, config_name):
     config = transformers.AutoConfig.from_pretrained(
         config_name,
         attn_implementation="flash_attention_2"
@@ -63,7 +63,7 @@ def get_model_quantized_quarot(config_name):
     dtype_old = torch.get_default_dtype()
     torch.set_default_dtype(torch.float16)
     with transformers.modeling_utils.no_init_weights(): 
-        model = modeling_llama.QuarotLlamaForCausalLM(config=config)
+        model = modeling_llama.FlatQuantLlamaForCausalLM(args=args, config=config)
     torch.set_default_dtype(dtype_old)
     return model
 
@@ -76,7 +76,7 @@ def get_model_hf(config_name):
     )
 
 def get_model_fp16(config_name):
-    return modeling_llama.QuarotFP16LlamaForCausalLM.from_pretrained(
+    return modeling_llama.FlatQuantFP16LlamaForCausalLM.from_pretrained(
         config_name, 
         torch_dtype=torch.float16, 
         attn_implementation="flash_attention_2"
@@ -136,44 +136,90 @@ def run_all_for_model(model, bsz, prefill, decode):
         time_decode = time_e2e = None
     return time_prefill, time_decode, time_e2e, memory_decode
 
+
+def print_e2e_time(args, time_prefill_i4, time_decode_i4, time_e2e_i4, time_prefill_f16, time_decode_f16, time_e2e_f16,
+                   time_prefill_i4_benchmark=None, time_decode_i4_benchmark=None, time_e2e_i4_benchmark=None):
+    prefill_speedup = np.mean(time_prefill_f16) / np.mean(time_prefill_i4)
+    prefill_benchmark_speedup = np.mean(time_prefill_f16) / np.mean(time_prefill_i4_benchmark) if time_prefill_i4_benchmark is not None else None
+    print(f"Prefill time: {np.mean(time_prefill_i4):.3f} +- {1.96 * np.std(time_prefill_i4):.3f}ms\n"
+            f"Speedup: {prefill_speedup:.3f}"
+            + (f" Speedup loss: {prefill_benchmark_speedup - prefill_speedup:.3f}" if time_prefill_i4_benchmark is not None else ""))
+    if args.decode_steps is not None and args.decode_steps != 0:
+        decode_speedup = np.mean(time_decode_f16) / np.mean(time_decode_i4)
+        decode_benchmark_speedup = np.mean(time_decode_f16) / np.mean(time_decode_i4_benchmark) if time_decode_i4_benchmark is not None else None
+        print(f"Decode time: {np.mean(time_decode_i4):.3f} +- {1.96 * np.std(time_decode_i4):.3f}ms\n"
+                f"Speedup: {decode_speedup:.3f}"
+                + (f" Speedup loss: {decode_benchmark_speedup - decode_speedup:.3f}" if time_decode_i4_benchmark is not None else ""))
+        e2e_speedup = np.mean(time_e2e_f16) / np.mean(time_e2e_i4)
+        e2e_benchmark_speedup = np.mean(time_e2e_f16) / np.mean(time_e2e_i4_benchmark) if time_e2e_i4_benchmark is not None else None
+        print(f"E2E time: {np.mean(time_e2e_i4):.3f} +- {1.96 * np.std(time_e2e_i4):.3f}ms\n"
+                f"Speedup: {e2e_speedup:.3f}"
+                + (f" Speedup loss: {e2e_benchmark_speedup - e2e_speedup:.3f}" if time_e2e_i4_benchmark is not None else ""))
+
+
 def benchmark(args):
-    
     for config_name in model_configs:
-        model = get_model_quantized_quarot(config_name)
-        time_prefill_i4, time_decode_i4, time_e2e_i4, mem_i4 = run_all_for_model(
-            model, args.batch_size, args.prefill_seq_len, args.decode_steps)
-        del model
-        _cleanup()
+        pprint.pprint(vars(args))
+
+        # FP16
+        print(f'------------------------- FP16 ------------------------')
+        args.fuseLN, args.trans = False, "none"
+        args.online_trans = set()
         model = get_model_fp16(config_name)
         time_prefill_f16, time_decode_f16, time_e2e_f16, mem_f16 = run_all_for_model(
             model, args.batch_size, args.prefill_seq_len, args.decode_steps)
         del model
         _cleanup()
+        print(f"Prefill time: {np.mean(time_prefill_f16):.3f} +- {1.96 * np.std(time_prefill_f16):.3f}ms")
+        if args.decode_steps is not None and args.decode_steps != 0:
+            print(f"Decode time: {np.mean(time_decode_f16):.3f} +- {1.96 * np.std(time_decode_f16):.3f}ms")
+            print(f"E2E time: {np.mean(time_e2e_f16):.3f} +- {1.96 * np.std(time_e2e_f16):.3f}ms")
 
-        print(f"Prefill Int4 time: {np.mean(time_prefill_i4):.3f} +- {1.96 * np.std(time_prefill_i4):.3f}ms")
-        print(f"Prefill FP16 time: {np.mean(time_prefill_f16):.3f} +- {1.96 * np.std(time_prefill_f16):.3f}ms")
-        print(f"Speedup: {np.mean(time_prefill_f16) / np.mean(time_prefill_i4):.3f}x")
-        print(f'Prefill & {config_name} & {args.batch_size} & {args.prefill_seq_len} & {np.mean(time_prefill_f16):.3f} & {np.mean(time_prefill_i4):.3f}\\\\')
-
-        if args.decode_steps is not None:
-            print(f"Decode Int4 time: {np.mean(time_decode_i4):.3f} +- {1.96 * np.std(time_decode_i4):.3f}ms")
-            print(f"Decode FP16 time: {np.mean(time_decode_f16):.3f} +- {1.96 * np.std(time_decode_f16):.3f}ms")
-            print(f"Speedup: {np.mean(time_decode_f16) / np.mean(time_decode_i4):.3f}x")
-            print(f'Decode & {config_name} & {args.batch_size} & {args.prefill_seq_len} & {args.decode_steps} & {np.mean(time_decode_f16):.3f} & {np.mean(time_decode_i4):.3f}\\\\')
-
-            print(f"E2E Int4 time: {np.mean(time_e2e_i4):.3f} +- {1.96 * np.std(time_e2e_i4):.3f}ms")
-            print(f"E2E FP16 time: {np.mean(time_e2e_f16):.3f} +- {1.96 * np.std(time_e2e_f16):.3f}ms")
-            print(f"Speedup: {np.mean(time_e2e_f16) / np.mean(time_e2e_i4):.3f}x")
-            print(f'E2E & {config_name} & {args.batch_size} & {args.prefill_seq_len} & {args.decode_steps} & {np.mean(time_e2e_f16):.3f} & {np.mean(time_e2e_i4):.3f}\\\\')
+        # Int4
+        print(f'------------------------- Int4 ------------------------')
+        args.fuseLN, args.trans = False, "none"
+        args.online_trans = set()
+        model = get_model_quantized(args, config_name)
+        time_prefill_i4_benchmark, time_decode_i4_benchmark, time_e2e_i4_benchmark, mem_i4 = run_all_for_model(
+            model, args.batch_size, args.prefill_seq_len, args.decode_steps)
+        del model
+        _cleanup()
+        print_e2e_time(args, time_prefill_i4_benchmark, time_decode_i4_benchmark, time_e2e_i4_benchmark,
+                       time_prefill_f16, time_decode_f16, time_e2e_f16)
         
-        # table-style output
-
-        print(f"Int4 memory: {np.mean(mem_i4) / (1024 * 1024 * 1024):.3f}GB +- {1.96 * np.std(mem_i4):.3f}")
-        print(f"FP16 memory: {np.mean(mem_f16) / (1024 * 1024 * 1024):.3f}GB +- {1.96 * np.std(mem_f16):.3f}")
-        print(f"Memory saving: {np.mean(mem_f16) / np.mean(mem_i4):.3f}x")
-        print(f'Memory saving & {config_name} & {args.batch_size} & {args.prefill_seq_len} & {args.decode_steps} & {np.mean(mem_i4) / (1024 * 1024 * 1024):.3f}GB & {np.mean(mem_f16) / (1024 * 1024 * 1024):.3f}GB\\\\')
-        
-        print('--------------')
+        # QuaRot
+        args.fuseLN, args.trans = True, "had"
+        online_trans_list = [
+            {"o_proj", "qk", "down_proj"}
+        ]
+        for online_trans in online_trans_list:
+            print(f"------------------------- Int4 QuaRot ({'+'.join(online_trans)}) ------------------------")
+            args.online_trans = online_trans
+            model = get_model_quantized(args, config_name)
+            time_prefill_i4, time_decode_i4, time_e2e_i4, mem_i4 = run_all_for_model(
+                model, args.batch_size, args.prefill_seq_len, args.decode_steps)
+            del model
+            _cleanup()
+            print_e2e_time(args, time_prefill_i4, time_decode_i4, time_e2e_i4,
+                           time_prefill_f16, time_decode_f16, time_e2e_f16,
+                           time_prefill_i4_benchmark, time_decode_i4_benchmark, time_e2e_i4_benchmark)
+            
+        # FlatQuant
+        args.fuseLN, args.trans = False, "matmul"
+        online_trans_list = [
+            {"qk", "o_proj", "down_proj", "qkv_proj", "up_gate_proj"}
+        ]
+        for online_trans in online_trans_list:
+            print(f"------------------------- Int4 FlatQuant ({'+'.join(online_trans)}) ------------------------")
+            args.online_trans = online_trans
+            model = get_model_quantized(args, config_name)
+            time_prefill_i4, time_decode_i4, time_e2e_i4, mem_i4 = run_all_for_model(
+                model, args.batch_size, args.prefill_seq_len, args.decode_steps)
+            del model
+            _cleanup()
+            print_e2e_time(args, time_prefill_i4, time_decode_i4, time_e2e_i4,
+                           time_prefill_f16, time_decode_f16, time_e2e_f16,
+                           time_prefill_i4_benchmark, time_decode_i4_benchmark, time_e2e_i4_benchmark)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -181,7 +227,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--batch_size', type=int,
         help='Batch size',
-        default=1,
+        default=None,
     )
     parser.add_argument(
         '--prefill_seq_len', type=int,
@@ -191,10 +237,13 @@ if __name__ == '__main__':
     parser.add_argument(
         '--decode_steps', type=int,
         help='Decode steps',
-        required=False,
-        default=None,
+        default=256,
     )
     
     args = parser.parse_args()
-    pprint.pprint(vars(args))
-    benchmark(args)
+    if args.batch_size is None:
+        for bsz in [1, 2, 4, 8, 16, 32, 64]:
+            args.batch_size = bsz
+            benchmark(args)
+    else:
+        benchmark(args)
