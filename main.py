@@ -48,7 +48,7 @@ def main():
         save_dict["w_quantizers"] = quantizers
 
     ## save quantized weight
-    flat_utils.save_quantized_weights(args, model, quantizers)
+    flat_utils.save_quantized_weights_with_deploy(args, model, quantizers)
 
     if args.distribute_model:
         utils.distribute_model(model)
@@ -56,7 +56,7 @@ def main():
         model.to(utils.DEV)
     
     # Evaluating PPL
-    """for eval_dataset in ["wikitext2", "c4"]:
+    for eval_dataset in ["wikitext2", "c4"]:
         logger.info(eval_dataset)
         testloader = data_utils.get_loaders(
                 args,
@@ -68,7 +68,7 @@ def main():
                 eval_mode=True
             )
         dataset_ppl = eval_utils.ppl_eval(model, testloader)
-        logger.info(dataset_ppl)"""
+        logger.info(dataset_ppl)
 
 
     if args.lm_eval:

@@ -141,4 +141,49 @@ def save_quantized_weights(args, model, quantizers, sym = True):
     }, quantized_weights_path)
     logging.info("saved weights at {}".format(quantized_weights_path))
 
+## save int8 with deploy.PackedQuantizedTensor
+def save_quantized_weights_with_deploy(args, model, quantizers, sym = True):
 
+    from deploy.functional import pack_i4
+
+    state_dict = {}
+    
+    for name, param in model.named_parameters():
+        if name.endswith('.weight') or name.endswith('.bias'):
+            layer_name = name.rsplit('.', 1)[0]
+        else:
+            layer_name = name
+            
+        is_quantized = layer_name in quantizers
+        
+        if is_quantized and 'weight' in name:
+            scale = quantizers[layer_name].scale
+            maxq = quantizers[layer_name].maxq
+            zero = quantizers[layer_name].zero
+            
+            scale = scale.to(param.device)
+            zero = zero.to(param.device)
+            maxq = maxq.to(param.device)
+
+            if sym:
+                param_quant = torch.clamp((param / scale).round(), -(maxq + 1), maxq)
+            else:
+                param_quant = torch.clamp((param / scale).round() + zero, 0, maxq)
+            
+            param_quant_int8 = param_quant.to(torch.int8)
+            state_dict[name] = pack_i4(param_quant_int8)
+
+        else:
+            state_dict[name] = param
+
+    quantized_weights_path = os.path.join(args.exp_dir, f"quantized_weights_deploy.pth")
+
+    torch.save({
+        'model_state_dict': state_dict,
+        'quantizers': quantizers,
+        'config': {
+            'w_bits': args.w_bits,
+            'model_name': args.model
+        }
+    }, quantized_weights_path)
+    logging.info("saved weights at {}".format(quantized_weights_path))
