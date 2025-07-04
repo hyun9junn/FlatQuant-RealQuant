@@ -24,7 +24,7 @@ def repeated_run(num_repeats=10):
         def _f(*args, **kwargs):
             times = []
             for i in range(num_repeats):
-                times.append(module(*args, **kwargs))
+                times.append(module(*args, **kwargs, repeat_idx = i))
             return tuple(zip(*times))
         return _f
     return func
@@ -34,10 +34,17 @@ def _cleanup():
     torch.cuda.empty_cache()
 
 @repeated_run()
-def module_benchmark(module):
+def module_benchmark(module, repeat_idx):
     # warmup
     for i in range(num_warmup_steps):
+        if repeat_idx == 0 and i == 0:
+            before_forward = print_gpu_memory("before forward")
         out = module()
+        if repeat_idx == 0 and i == 0:
+            after_forward = print_gpu_memory("after forward")
+            peak = torch.cuda.max_memory_allocated() / 1024**3
+            print(f"Peak memory during forward: {peak:.2f} GB")
+            print(f"for forward without model: {(peak - before_forward):.2f} GB")
     torch.cuda.synchronize()
     
     _cleanup()
@@ -156,6 +163,11 @@ def print_e2e_time(args, time_prefill_i4, time_decode_i4, time_e2e_i4, time_pref
                 f"Speedup: {e2e_speedup:.3f}"
                 + (f" Speedup loss: {e2e_benchmark_speedup - e2e_speedup:.3f}" if time_e2e_i4_benchmark is not None else ""))
 
+## print allocated gpu memory
+def print_gpu_memory(prefix=""):
+    allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+    print(f"{prefix} GPU memory - Allocated: {allocated:.2f} GB")
+    return allocated
 
 def benchmark(args):
     for config_name in model_configs:
@@ -164,9 +176,13 @@ def benchmark(args):
         # FP16
         args.fuseLN, args.trans = False, "none"
         args.online_trans = set()
+        print_gpu_memory("before load model")
         model = get_model_fp16(config_name)
+        model.to('cuda')
+        print_gpu_memory("after load model")
         time_prefill_f16, time_decode_f16, time_e2e_f16, mem_f16 = run_all_for_model(
             model, args.batch_size, args.prefill_seq_len, args.decode_steps)
+        print_gpu_memory("after run_all")
         del model
         _cleanup()
         print(f'------------------------- FP16 ------------------------')
