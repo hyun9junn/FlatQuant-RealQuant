@@ -16,7 +16,7 @@ model_configs = [
 ]
 
 benchmark_dtypes = ["int4", torch.float16]
-num_warmup_steps = 0
+num_warmup_steps = 2
 num_bench_steps = 1
 
 def repeated_run(num_repeats=10):
@@ -162,7 +162,6 @@ def benchmark(args):
         pprint.pprint(vars(args))
 
         # FP16
-        print(f'------------------------- FP16 ------------------------')
         args.fuseLN, args.trans = False, "none"
         args.online_trans = set()
         model = get_model_fp16(config_name)
@@ -170,6 +169,7 @@ def benchmark(args):
             model, args.batch_size, args.prefill_seq_len, args.decode_steps)
         del model
         _cleanup()
+        print(f'------------------------- FP16 ------------------------')
         print(f"Prefill time: {np.mean(time_prefill_f16):.3f} +- {1.96 * np.std(time_prefill_f16):.3f}ms")
         if args.decode_steps is not None and args.decode_steps != 0:
             print(f"Decode time: {np.mean(time_decode_f16):.3f} +- {1.96 * np.std(time_decode_f16):.3f}ms")
