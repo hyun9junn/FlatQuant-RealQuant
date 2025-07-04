@@ -174,7 +174,7 @@ def save_quantized_weights_with_deploy(args, model, quantizers, sym = True):
             state_dict[name] = pack_i4(param_quant_int8)
 
         else:
-            state_dict[name] = param
+            state_dict[name] = param.to(torch.half)
 
     quantized_weights_path = os.path.join(args.exp_dir, f"quantized_weights_deploy.pth")
 
