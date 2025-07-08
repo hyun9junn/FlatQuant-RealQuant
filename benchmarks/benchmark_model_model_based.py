@@ -9,6 +9,9 @@ import deploy.transformers.modeling_llama as modeling_llama
 import torch
 import transformers
 
+import flatquant.data_utils as data_utils
+from tqdm import tqdm
+
 model_configs = [
     "./modelzoo/llama-2/llama-2-7b",
     # "./modelzoo/llama-2-13b",
@@ -37,14 +40,14 @@ def _cleanup():
 def module_benchmark(module, repeat_idx):
     # warmup
     for i in range(num_warmup_steps):
-        if repeat_idx == 0 and i == 0:
-            before_forward = print_gpu_memory("before forward")
+        """if repeat_idx == 0 and i == 0:
+            before_forward = print_gpu_memory("before forward")"""
         out = module()
-        if repeat_idx == 0 and i == 0:
+        """if repeat_idx == 0 and i == 0:
             after_forward = print_gpu_memory("after forward")
             peak = torch.cuda.max_memory_allocated() / 1024**3
             print(f"Peak memory during forward: {peak:.2f} GB")
-            print(f"for forward without model: {(peak - before_forward):.2f} GB")
+            print(f"for forward without model: {(peak - before_forward):.2f} GB")"""
     torch.cuda.synchronize()
     
     _cleanup()
@@ -60,6 +63,69 @@ def module_benchmark(module, repeat_idx):
     end_time = time.perf_counter()
 
     return (end_time - start_time) * 1000 / num_bench_steps, peak_memory
+
+def load_dataset(config_name):
+    for eval_dataset in ["wikitext2"]:
+        testloader = data_utils.get_loaders(
+                    args = None,
+                    name = eval_dataset,
+                    model = config_name,
+                    seqlen = 2048,
+                    eval_mode = True
+                )
+    return testloader
+
+@torch.no_grad()
+def ppl_eval(model, testenc):
+    print('Evaluating ppl...')
+    model.eval()
+    model = model.cuda()
+    max_length = 2048   # fix model max length
+
+    testenc = testenc.input_ids
+    nsamples = testenc.numel() // max_length
+
+    dev = next(model.parameters()).device
+
+    testenc = testenc.to(dev)
+
+    # warmup
+    for i in range(num_warmup_steps):
+        batch = testenc[:, (i * max_length): ((i + 1) * max_length)]
+        out = model(batch)
+    torch.cuda.synchronize()
+    _cleanup()
+
+    nlls = []
+    inference_times = []
+    
+    for i in tqdm(range(nsamples)):
+        batch = testenc[:, (i * max_length): ((i + 1) * max_length)]
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter()
+
+        lm_logits = model(batch).logits
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter()
+
+        inference_times.append((end_time - start_time) * 1000)
+
+        shift_logits = lm_logits[:, :-1, :].contiguous()
+        shift_labels = testenc[
+            :, (i * max_length): ((i + 1) * max_length)
+        ][:, 1:].to(shift_logits.device)
+
+        loss_fct = torch.nn.CrossEntropyLoss()
+        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        neg_log_likelihood = loss.float() * max_length
+        nlls.append(neg_log_likelihood)
+    ppl = torch.exp(torch.stack(nlls).sum() / (len(nlls) * max_length))
+    avg_time = np.mean(inference_times)
+    std_time = np.std(inference_times)
+
+    return ppl.item(), avg_time, std_time
 
 def rename_keys(checkpoint):
     new_checkpoint = {
@@ -224,16 +290,22 @@ def benchmark(args):
     for config_name in model_configs:
         pprint.pprint(vars(args))
 
+        print("Loading dataset...")
+        test_data = load_dataset(config_name = config_name)
+        print(f"Loaded dataset")
+
         # FP16
         args.fuseLN, args.trans = False, "none"
         args.online_trans = set()
-        print_gpu_memory("before load model")
+        #print_gpu_memory("before load model")
         model = get_model_fp16(config_name)
         model.to('cuda')
-        print_gpu_memory("after load model")
+        #print_gpu_memory("after load model")
         time_prefill_f16, time_decode_f16, time_e2e_f16, mem_f16 = run_all_for_model(
             model, args.batch_size, args.prefill_seq_len, args.decode_steps)
-        print_gpu_memory("after run_all")
+        #print_gpu_memory("after run_all")
+
+        ppl_f16, time_f16, std_f16 = ppl_eval(model = model, testenc = test_data)
         del model
         _cleanup()
         print(f'------------------------- FP16 ------------------------')
@@ -242,6 +314,9 @@ def benchmark(args):
             print(f"Decode time: {np.mean(time_decode_f16):.3f} +- {1.96 * np.std(time_decode_f16):.3f}ms")
             print(f"E2E time: {np.mean(time_e2e_f16):.3f} +- {1.96 * np.std(time_e2e_f16):.3f}ms")
 
+        print(f"test-inference time: {time_f16:.3f} +- {1.96 * std_f16:.3f}ms per sequence")
+        print(f"Perplexity: {ppl_f16:.3f}")
+
         # Int4
         print(f'------------------------- Int4 ------------------------')
         args.fuseLN, args.trans = False, "none"
@@ -249,11 +324,19 @@ def benchmark(args):
         model = get_model_quantized(args, config_name)
         time_prefill_i4_benchmark, time_decode_i4_benchmark, time_e2e_i4_benchmark, mem_i4 = run_all_for_model(
             model, args.batch_size, args.prefill_seq_len, args.decode_steps)
+        
+        ppl_i4_benchmark, time_i4_benchmark, std_i4_benchmark = ppl_eval(model = model, testenc = test_data)
         del model
         _cleanup()
         print_e2e_time(args, time_prefill_i4_benchmark, time_decode_i4_benchmark, time_e2e_i4_benchmark,
                        time_prefill_f16, time_decode_f16, time_e2e_f16)
         
+        speedup_i4_benchmark = time_f16 / time_i4_benchmark
+        print(f"test-inference time: {time_i4_benchmark:.3f} +- {1.96 * std_i4_benchmark:.3f}ms per sequence")
+        print(f"Speedup: {speedup_i4_benchmark:.3f}x")
+        print(f"Perplexity: {ppl_i4_benchmark:.3f}")
+        print(f"Perplexity degradation: {ppl_i4_benchmark / ppl_f16:.3f}")
+
         # QuaRot
         args.fuseLN, args.trans = True, "had"
         online_trans_list = [
@@ -265,11 +348,19 @@ def benchmark(args):
             model = get_model_quantized(args, config_name)
             time_prefill_i4, time_decode_i4, time_e2e_i4, mem_i4 = run_all_for_model(
                 model, args.batch_size, args.prefill_seq_len, args.decode_steps)
+            
+            ppl_i4, time_i4, std_i4 = ppl_eval(model = model, testenc = test_data)
             del model
             _cleanup()
             print_e2e_time(args, time_prefill_i4, time_decode_i4, time_e2e_i4,
                            time_prefill_f16, time_decode_f16, time_e2e_f16,
                            time_prefill_i4_benchmark, time_decode_i4_benchmark, time_e2e_i4_benchmark)
+   
+        speedup_i4 = time_f16 / time_i4
+        print(f"test-inference time: {time_i4:.3f} +- {1.96 * std_i4:.3f}ms per sequence")
+        print(f"Speedup: {speedup_i4:.3f}x Speedup loss: {(speedup_i4_benchmark - speedup_i4):.3f}")
+        print(f"Perplexity: {ppl_i4:.3f}")
+        print(f"Perplexity degradation: {ppl_i4 / ppl_f16:.3f}")
             
         # FlatQuant
         args.fuseLN, args.trans = False, "matmul"
@@ -285,11 +376,19 @@ def benchmark(args):
             model = get_model_quantized(args, config_name, weight_path)
             time_prefill_i4, time_decode_i4, time_e2e_i4, mem_i4 = run_all_for_model(
                 model, args.batch_size, args.prefill_seq_len, args.decode_steps)
+                        
+            ppl_i4, time_i4, std_i4 = ppl_eval(model = model, testenc = test_data)
             del model
             _cleanup()
             print_e2e_time(args, time_prefill_i4, time_decode_i4, time_e2e_i4,
                            time_prefill_f16, time_decode_f16, time_e2e_f16,
                            time_prefill_i4_benchmark, time_decode_i4_benchmark, time_e2e_i4_benchmark)
+            
+            speedup_i4 = time_f16 / time_i4
+            print(f"test-inference time: {time_i4:.3f} +- {1.96 * std_i4:.3f}ms per sequence")
+            print(f"Speedup: {speedup_i4:.3f}x Speedup loss: {(speedup_i4_benchmark - speedup_i4):.3f}")
+            print(f"Perplexity: {ppl_i4:.3f}")
+            print(f"Perplexity degradation: {ppl_i4 / ppl_f16:.3f}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
