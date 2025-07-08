@@ -84,15 +84,17 @@ def rename_keys(checkpoint):
                  .replace("up_proj.act_quantizer", "quantizer_u") \
                  .replace("down_proj.linear", "down_proj.2") \
                  .replace("down_proj.act_quantizer", "down_proj.1") \
-                 .replace("down_trans.matrix_left", "down_proj.2.left_matrix") \
-                 .replace("down_trans.matrix_right", "down_proj.2.right_matrix") \
+                 .replace("down_trans.matrix_left", "down_proj.0.left_matrix") \
+                 .replace("down_trans.matrix_right", "down_proj.0.right_matrix") \
                  .replace("up_gate_trans.matrix_left", "inp_trans.left_matrix") \
                  .replace("up_gate_trans.matrix_right", "inp_trans.right_matrix")
         new_checkpoint["model_state_dict"][new_k] = v
     
     for k, v in checkpoint["quantizers"].items():
-        new_k = k.replace("linear.scale", "weight_scales")
-        new_checkpoint["quantizers"][new_k] = v
+        new_k = k.replace("linear", "weight_scales") \
+                 .replace("mlp.down_proj.weight_scales", "mlp.down_proj.2.weight_scales") \
+                 .replace("self_attn.o_proj.weight_scales", "self_attn.o_proj.1.weight_scales")
+        new_checkpoint["quantizers"][new_k] = v.scale
 
     return new_checkpoint
 
@@ -109,10 +111,16 @@ def get_model_quantized(args, config_name, checkpoint_path = None):
     if checkpoint_path:
         checkpoint = torch.load(checkpoint_path, weights_only = False)
         new_checkpoint = rename_keys(checkpoint = checkpoint)
-        model.load_state_dict(new_checkpoint['model_state_dict'], strict = False)
+        missing_keys_1, unexpected_keys_1 = model.load_state_dict(new_checkpoint["model_state_dict"], strict=False)
         print("success to load model_state_dict")
-        model.load_state_dict(new_checkpoint['quantizers'], strict = False)
+
+        missing_keys_2, unexpected_keys_2  = model.load_state_dict(new_checkpoint['quantizers'], strict = False)
         print("success to load quantizers")
+
+        missing_keys_both = set(missing_keys_1) & set(missing_keys_2)
+        print(f"Keys missing in both model_state_dict and quantizers: {len(missing_keys_both)}")
+        for k in sorted(missing_keys_both):
+            print(f"{k}")
 
     torch.set_default_dtype(dtype_old)
     return model

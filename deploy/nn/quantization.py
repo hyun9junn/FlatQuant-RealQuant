@@ -3,12 +3,12 @@ import torch
 
 
 class Quantizer(torch.nn.Module):
-    def __init__(self, input_clip_ratio=1.0, lac = False, clip_factor_a_max = 4.0, clip_factor_a_min = 4.0):
+    def __init__(self, input_clip_ratio=1.0, lac = False):
         super().__init__()
         self.input_clip_ratio = input_clip_ratio
         self.lac = lac
-        self.clip_factor_a_max = clip_factor_a_max
-        self.clip_factor_a_min = clip_factor_a_min
+        self.register_buffer("clip_factor_a_max", torch.tensor(4.0))
+        self.register_buffer("clip_factor_a_min", torch.tensor(4.0))
         if self.lac:
             self.sigmoid = torch.nn.Sigmoid() ## Future work: save 할 때 sigmoid 이후 save
 
@@ -20,8 +20,8 @@ class Quantizer(torch.nn.Module):
                 tmp = torch.zeros_like(xmax)
                 xmax, xmin = torch.maximum(xmax, tmp), torch.minimum(xmin, tmp)
 
-                xmax = xmax * self.sigmoid(torch.tensor(self.clip_factor_a_max, device = x.device))
-                xmin = xmin * self.sigmoid(torch.tensor(self.clip_factor_a_min, device = x.device))
+                xmax = xmax * self.sigmoid(self.clip_factor_a_max.to(x.device))
+                xmin = xmin * self.sigmoid(self.clip_factor_a_min.to(x.device))
 
                 xmax = torch.maximum(torch.abs(xmin), xmax)
                 tmp = xmax == 0
