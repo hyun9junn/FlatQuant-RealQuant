@@ -9,7 +9,7 @@ from deploy.functional.quantization import get_minq_maxq
 
 
 @torch.jit.script
-def asym_quantize_and_pack_i4(x: torch.Tensor):
+def asym_quantize_and_pack_i4(x: torch.Tensor): ## TODO cache quantizer 적용
     minq, maxq = get_minq_maxq(bits=4, sym=False)
     xmax = torch.amax(x, dim=-1, keepdim=True)
     xmin = torch.amin(x, dim=-1, keepdim=True)
@@ -122,7 +122,7 @@ class _AttentionStub(object):
             if self.head_dim is None:
                 q = matmul_had_cuda(q, dtype=self.trans_dtype) 
             else:
-                q = torch.matmul(q.to(self.trans_dtype), self.head_dim)
+                q = torch.matmul(q.to(self.trans_dtype), self.head_dim) ## trans for q
         attn_output = torch.empty_like(q)
         if self.disable_quant:
             batch_decode = batch_decode_f16
@@ -160,7 +160,7 @@ class MultiLayerPagedKVCache4Bit(Cache):
         if self.trans == "had":
             self.head_dim = None
         elif self.trans.startswith("matmul"):
-            self.head_dim = torch.randn([head_dim, head_dim], requires_grad=False).to(trans_dtype).to(device)
+            self.head_dim = torch.randn([head_dim, head_dim], requires_grad=False).to(trans_dtype).to(device) ## TODO want real trans_matrix
         else:
             trans_dtype = None
             self.head_dim = None
@@ -208,7 +208,7 @@ class MultiLayerPagedKVCache4Bit(Cache):
             if self.head_dim is None:
                 key_states = matmul_had_cuda(key_states, dtype=self.trans_dtype)
             else:
-                key_states = torch.matmul(key_states.to(self.trans_dtype), self.head_dim)
+                key_states = torch.matmul(key_states.to(self.trans_dtype), self.head_dim) ## trans for k / need for v
 
         if self.disable_quant:
             k_scale = key_states.new_ones((b_sz, added_length, num_heads, 1))

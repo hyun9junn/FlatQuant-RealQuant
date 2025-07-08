@@ -3,13 +3,34 @@ import torch
 
 
 class Quantizer(torch.nn.Module):
-    def __init__(self, input_clip_ratio=1.0):
+    def __init__(self, input_clip_ratio=1.0, lac = False, clip_factor_a_max = 4.0, clip_factor_a_min = 4.0):
         super().__init__()
         self.input_clip_ratio = input_clip_ratio
-    
+        self.lac = lac
+        self.clip_factor_a_max = clip_factor_a_max
+        self.clip_factor_a_min = clip_factor_a_min
+        if self.lac:
+            self.sigmoid = torch.nn.Sigmoid() ## Future work: save 할 때 sigmoid 이후 save
+
     def forward(self, x):
         if not isinstance(x, deploy.PackedQuantizedTensor):
-            scales_x = (torch.max(torch.abs(x), dim=-1)[0].unsqueeze(1)/7).to(torch.float16) * self.input_clip_ratio
+            if self.lac:
+                reshaped_x = x.reshape((-1, x.shape[-1]))
+                xmax, xmin = reshaped_x.amax(1, keepdim=True), reshaped_x.amin(1, keepdim=True)
+                tmp = torch.zeros_like(xmax)
+                xmax, xmin = torch.maximum(xmax, tmp), torch.minimum(xmin, tmp)
+
+                xmax = xmax * self.sigmoid(torch.tensor(self.clip_factor_a_max, device = x.device))
+                xmin = xmin * self.sigmoid(torch.tensor(self.clip_factor_a_min, device = x.device))
+
+                xmax = torch.maximum(torch.abs(xmin), xmax)
+                tmp = xmax == 0
+                scales_x = (xmax / 7)
+                scales_x[tmp] = 1
+                scales_x = scales_x.to(torch.float16)
+            else:
+                scales_x = (torch.max(torch.abs(x), dim=-1)[0].unsqueeze(1)/7).to(torch.float16) * self.input_clip_ratio
+
             quantized_x = deploy.sym_quant(x, scales_x)
             packed_tensor = deploy.PackedQuantizedTensor(quantized_x, scales_x)
             return packed_tensor

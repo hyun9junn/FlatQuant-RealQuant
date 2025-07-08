@@ -61,8 +61,42 @@ def module_benchmark(module, repeat_idx):
 
     return (end_time - start_time) * 1000 / num_bench_steps, peak_memory
 
+def rename_keys(checkpoint):
+    new_checkpoint = {
+        "model_state_dict": {},
+        "quantizers": {}
+    }
+    for k, v in checkpoint["model_state_dict"].items():
+        new_k = k.replace("q_proj.linear", "q_proj") \
+                 .replace("q_proj.act_quantizer", "quantizer_q") \
+                 .replace("k_proj.linear", "k_proj") \
+                 .replace("k_proj.act_quantizer", "quantizer_k") \
+                 .replace("v_proj.linear", "v_proj") \
+                 .replace("v_proj.act_quantizer", "quantizer_v") \
+                 .replace("o_proj.linear", "o_proj.1") \
+                 .replace("o_proj.act_quantizer", "o_proj.0") \
+                 .replace("ln_trans.matrix_left", "inp_trans.left_matrix") \
+                 .replace("ln_trans.matrix_right", "inp_trans.right_matrix") \
+                 .replace("o_trans.matrix", "o_proj_trans.right_matrix") \
+                 .replace("gate_proj.linear", "gate_proj") \
+                 .replace("gate_proj.act_quantizer", "quantizer_g") \
+                 .replace("up_proj.linear", "up_proj") \
+                 .replace("up_proj.act_quantizer", "quantizer_u") \
+                 .replace("down_proj.linear", "down_proj.2") \
+                 .replace("down_proj.act_quantizer", "down_proj.1") \
+                 .replace("down_trans.matrix_left", "down_proj.2.left_matrix") \
+                 .replace("down_trans.matrix_right", "down_proj.2.right_matrix") \
+                 .replace("up_gate_trans.matrix_left", "inp_trans.left_matrix") \
+                 .replace("up_gate_trans.matrix_right", "inp_trans.right_matrix")
+        new_checkpoint["model_state_dict"][new_k] = v
+    
+    for k, v in checkpoint["quantizers"].items():
+        new_k = k.replace("linear.scale", "weight_scales")
+        new_checkpoint["quantizers"][new_k] = v
 
-def get_model_quantized(args, config_name):
+    return new_checkpoint
+
+def get_model_quantized(args, config_name, checkpoint_path = None):
     config = transformers.AutoConfig.from_pretrained(
         config_name,
         attn_implementation="flash_attention_2"
@@ -71,6 +105,15 @@ def get_model_quantized(args, config_name):
     torch.set_default_dtype(torch.float16)
     with transformers.modeling_utils.no_init_weights(): 
         model = modeling_llama.FlatQuantLlamaForCausalLM(args=args, config=config)
+
+    if checkpoint_path:
+        checkpoint = torch.load(checkpoint_path, weights_only = False)
+        new_checkpoint = rename_keys(checkpoint = checkpoint)
+        model.load_state_dict(new_checkpoint['model_state_dict'], strict = False)
+        print("success to load model_state_dict")
+        model.load_state_dict(new_checkpoint['quantizers'], strict = False)
+        print("success to load quantizers")
+
     torch.set_default_dtype(dtype_old)
     return model
 
@@ -228,7 +271,10 @@ def benchmark(args):
         for online_trans in online_trans_list:
             print(f"------------------------- Int4 FlatQuant ({'+'.join(online_trans)}) ------------------------")
             args.online_trans = online_trans
-            model = get_model_quantized(args, config_name)
+            import os
+            model_name = os.path.basename(config_name)
+            weight_path = os.path.join(".", "outputs", model_name, "w4a4", "exp", "quantized_weights_deploy.pth")
+            model = get_model_quantized(args, config_name, weight_path)
             time_prefill_i4, time_decode_i4, time_e2e_i4, mem_i4 = run_all_for_model(
                 model, args.batch_size, args.prefill_seq_len, args.decode_steps)
             del model
