@@ -9,8 +9,6 @@ class Quantizer(torch.nn.Module):
         self.lac = lac
         self.register_buffer("clip_factor_a_max", torch.tensor(4.0))
         self.register_buffer("clip_factor_a_min", torch.tensor(4.0))
-        if self.lac:
-            self.sigmoid = torch.nn.Sigmoid() ## Future work: save 할 때 sigmoid 이후 save
 
     def forward(self, x):
         if not isinstance(x, deploy.PackedQuantizedTensor):
@@ -20,8 +18,8 @@ class Quantizer(torch.nn.Module):
                 tmp = torch.zeros_like(xmax)
                 xmax, xmin = torch.maximum(xmax, tmp), torch.minimum(xmin, tmp)
 
-                xmax = xmax * self.sigmoid(self.clip_factor_a_max.to(x.device))
-                xmin = xmin * self.sigmoid(self.clip_factor_a_min.to(x.device))
+                xmax = xmax * torch.sigmoid(self.clip_factor_a_max.to(x.device))
+                xmin = xmin * torch.sigmoid(self.clip_factor_a_min.to(x.device))
 
                 xmax = torch.maximum(torch.abs(xmin), xmax)
                 tmp = xmax == 0
