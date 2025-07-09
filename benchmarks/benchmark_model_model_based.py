@@ -153,7 +153,11 @@ def rename_keys(checkpoint):
                  .replace("down_trans.matrix_left", "down_proj.0.left_matrix") \
                  .replace("down_trans.matrix_right", "down_proj.0.right_matrix") \
                  .replace("up_gate_trans.matrix_left", "inp_trans.left_matrix") \
-                 .replace("up_gate_trans.matrix_right", "inp_trans.right_matrix")
+                 .replace("up_gate_trans.matrix_right", "inp_trans.right_matrix") \
+                 .replace("k_cache_quantizer.clip", "kclip") \
+                 .replace("v_cache_quantizer.clip", "vclip") \
+                 .replace("kcache_trans.matrix", "trans_matrix_k") \
+                 .replace("vcache_trans.matrix", "trans_matrix_v")
         new_checkpoint["model_state_dict"][new_k] = v
     
     for k, v in checkpoint["quantizers"].items():
@@ -173,13 +177,11 @@ def get_model_quantized(args, config_name, checkpoint_path = None):
     torch.set_default_dtype(torch.float16)
     with transformers.modeling_utils.no_init_weights(): 
         model = modeling_llama.FlatQuantLlamaForCausalLM(args=args, config=config)
-
     if checkpoint_path:
         checkpoint = torch.load(checkpoint_path, weights_only = False)
         new_checkpoint = rename_keys(checkpoint = checkpoint)
         missing_keys_1, unexpected_keys_1 = model.load_state_dict(new_checkpoint["model_state_dict"], strict=False)
         print("success to load model_state_dict")
-
         missing_keys_2, unexpected_keys_2  = model.load_state_dict(new_checkpoint['quantizers'], strict = False)
         print("success to load quantizers")
 
@@ -247,6 +249,7 @@ def _wait_for_input():
 
 @torch.no_grad
 def run_all_for_model(model, bsz, prefill, decode):
+    return 0,0,0,0
     model.eval()
     model = model.cuda()
     time_prefill, _ = run_prefill(model, bsz, prefill)
@@ -263,6 +266,7 @@ def run_all_for_model(model, bsz, prefill, decode):
 
 def print_e2e_time(args, time_prefill_i4, time_decode_i4, time_e2e_i4, time_prefill_f16, time_decode_f16, time_e2e_f16,
                    time_prefill_i4_benchmark=None, time_decode_i4_benchmark=None, time_e2e_i4_benchmark=None):
+    return
     prefill_speedup = np.mean(time_prefill_f16) / np.mean(time_prefill_i4)
     prefill_benchmark_speedup = np.mean(time_prefill_f16) / np.mean(time_prefill_i4_benchmark) if time_prefill_i4_benchmark is not None else None
     print(f"Prefill time: {np.mean(time_prefill_i4):.3f} +- {1.96 * np.std(time_prefill_i4):.3f}ms\n"

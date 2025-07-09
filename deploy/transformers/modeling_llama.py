@@ -36,6 +36,7 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
+        cache_kwargs = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         output_attentions = False
@@ -67,7 +68,14 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
         assert past_key_value is not None
         # sin and cos are specific to RoPE models; position_ids needed for the static cache
         
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position, "attention_mask": attention_mask}
+        if cache_kwargs is None:
+            cache_kwargs = {}
+        cache_kwargs.update({
+            "sin": sin,
+            "cos": cos,
+            "cache_position": cache_position,
+            "attention_mask": attention_mask,
+        })
         cache_out = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
         
 
@@ -125,7 +133,55 @@ class FlatQuantLlamaAttention(FlatQuantFP16LlamaAttention):
         if "qkv_proj" in self.options.online_trans:
             if not self.options.fuseLN:
                 self.inp_trans = deploy.nn.OnlineTrans(self.hidden_size, trans=options.trans)
+        
+        num_heads = self.config.num_key_value_heads
+        model_dim = self.config.hidden_size
+        head_dim = model_dim // num_heads
 
+        self.register_buffer("trans_matrix_k", torch.randn([head_dim, head_dim], requires_grad = False))
+        self.register_buffer("trans_matrix_k_inv_t", torch.randn([head_dim, head_dim], requires_grad = False))
+        self.register_buffer("trans_matrix_v", torch.randn([head_dim, head_dim], requires_grad = False))
+        self.register_buffer("kclip_factor_a_max", torch.tensor(4.0))
+        self.register_buffer("kclip_factor_a_min", torch.tensor(4.0))
+        self.register_buffer("vclip_factor_a_max", torch.tensor(4.0))
+        self.register_buffer("vclip_factor_a_min", torch.tensor(4.0))
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        
+        cache_kwargs = {
+            "sin": kwargs.get("sin"),
+            "cos": kwargs.get("cos"),
+            "cache_position": cache_position,
+            "attention_mask": attention_mask,
+            "trans_matrix_k": self.trans_matrix_k,
+            "trans_matrix_k_inv_t": self.trans_matrix_k_inv_t,
+            "trans_matrix_v": self.trans_matrix_v,
+            "kclip_factor_a_max": self.kclip_factor_a_max,
+            "kclip_factor_a_min": self.kclip_factor_a_min,
+            "vclip_factor_a_max": self.vclip_factor_a_max,
+            "vclip_factor_a_min": self.vclip_factor_a_min,
+        }
+
+        return super().forward(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            cache_kwargs=cache_kwargs,
+        )
 
 class FlatQuantLlamaMLP(LlamaMLP):
     def __init__(self, options, *args, **kwargs):
