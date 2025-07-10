@@ -215,20 +215,7 @@ def block_matmul(b, c, seq_len):
     quant_res = torch.empty((B, M, N // 2), device=b.device, dtype=torch.uint8)
 
     # 1D launch kernel where each block gets its own program.
-    if FUSION:
-        grid = (1, seq_len, Actual_B)
-        matmul_quant_kernel[grid](
-            b, c,  #
-            quant_res, #
-            output_scale, #
-            B, M, N,  #
-            triton.next_power_of_2(M),
-            triton.next_power_of_2(N),
-            b.stride(0), b.stride(1), b.stride(2),  #
-            c.stride(0), c.stride(1), #
-            quant_res.stride(0), quant_res.stride(1), quant_res.stride(2),  #
-        )
-    else:
+    if True:
         bmm_res = torch.empty((B, M, N), device=b.device, dtype=b.dtype)
         grid = (1, seq_len, Actual_B)
         matmul_kernel[grid](
@@ -242,19 +229,48 @@ def block_matmul(b, c, seq_len):
             c.stride(0), c.stride(1), #
             bmm_res.stride(0), bmm_res.stride(1), bmm_res.stride(2),  #
         )
-        grid = (seq_len, Actual_B)
-        quant_kernel[grid](
-            bmm_res,
-            bmm_res.stride(0), bmm_res.stride(1), bmm_res.stride(2), 
-            quant_res,
-            quant_res.stride(0), quant_res.stride(1), quant_res.stride(2),
-            output_scale,
-            B, M, N,
-            triton.next_power_of_2(M),
-            triton.next_power_of_2(N),
-        )
-    packed_tensor = deploy.PackedQuantizedTensor(quant_res.reshape(B, -1), output_scale)
-    return packed_tensor
+        return bmm_res.view(B, -1)
+    else:
+        if FUSION:
+            grid = (1, seq_len, Actual_B)
+            matmul_quant_kernel[grid](
+                b, c,  #
+                quant_res, #
+                output_scale, #
+                B, M, N,  #
+                triton.next_power_of_2(M),
+                triton.next_power_of_2(N),
+                b.stride(0), b.stride(1), b.stride(2),  #
+                c.stride(0), c.stride(1), #
+                quant_res.stride(0), quant_res.stride(1), quant_res.stride(2),  #
+            )
+        else:
+            bmm_res = torch.empty((B, M, N), device=b.device, dtype=b.dtype)
+            grid = (1, seq_len, Actual_B)
+            matmul_kernel[grid](
+                b, c,  #
+                bmm_res, #
+                output_scale, #
+                B, M, N,  #
+                triton.next_power_of_2(M),
+                triton.next_power_of_2(N),
+                b.stride(0), b.stride(1), b.stride(2),  #
+                c.stride(0), c.stride(1), #
+                bmm_res.stride(0), bmm_res.stride(1), bmm_res.stride(2),  #
+            )
+            grid = (seq_len, Actual_B)
+            quant_kernel[grid](
+                bmm_res,
+                bmm_res.stride(0), bmm_res.stride(1), bmm_res.stride(2), 
+                quant_res,
+                quant_res.stride(0), quant_res.stride(1), quant_res.stride(2),
+                output_scale,
+                B, M, N,
+                triton.next_power_of_2(M),
+                triton.next_power_of_2(N),
+            )
+        packed_tensor = deploy.PackedQuantizedTensor(quant_res.reshape(B, -1), output_scale)
+        return packed_tensor
 
 
 def benchmark(B, M, N, S, provider):

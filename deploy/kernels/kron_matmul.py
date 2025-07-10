@@ -73,7 +73,7 @@ def matmul_kernel(
     accumulator = 0
     accumulator += tl.dot(tmp_ab, c)
 
-    if is_split:
+    if True:
         res = accumulator.to(tl.float16)
         
         offs_resm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -180,8 +180,8 @@ def kron_matmul(a, b, c, seq_len):
     # is_split = True
     output_scale = torch.empty((B, 1), device=a.device, dtype=torch.float16)
     quant_res = torch.empty((B, M, N // 2), device=a.device, dtype=torch.uint8)
+    bmm_res = torch.empty((B, M, N), device=a.device, dtype=a.dtype)
     if is_split:
-        bmm_res = torch.empty((B, M, N), device=a.device, dtype=a.dtype)
         # 2 x bmm
         # if we use grid (triton.cdiv(M, BLOCK_SIZE_M), B), the 2nd griddim value 'B' will exceed 65535
         grid = (triton.cdiv(M, BLOCK_SIZE_M), seq_len, Actual_B)
@@ -200,7 +200,7 @@ def kron_matmul(a, b, c, seq_len):
             is_split,
         )
         # quant fp16 to int4
-        grid = (seq_len, Actual_B)
+        """grid = (seq_len, Actual_B)
         quant_kernel[grid](
             bmm_res,
             bmm_res.stride(0), bmm_res.stride(1), bmm_res.stride(2), 
@@ -211,13 +211,13 @@ def kron_matmul(a, b, c, seq_len):
             triton.next_power_of_2(M),
             triton.next_power_of_2(N),
         )
-        packed_tensor = deploy.PackedQuantizedTensor(quant_res.reshape(B, -1), output_scale)
+        packed_tensor = deploy.PackedQuantizedTensor(quant_res.reshape(B, -1), output_scale)"""
     else:
         # 1D launch kernel where each block gets its own program.
         grid = (1, seq_len, Actual_B)
         matmul_kernel[grid](
             a, b, c,  #
-            quant_res, #
+            bmm_res, #
             output_scale, #
             B, M, N,  #
             triton.next_power_of_2(M),
@@ -225,12 +225,12 @@ def kron_matmul(a, b, c, seq_len):
             a.stride(0), a.stride(1), #
             b.stride(0), b.stride(1), b.stride(2),  #
             c.stride(0), c.stride(1), #
-            quant_res.stride(0), quant_res.stride(1), quant_res.stride(2),  #
+            bmm_res.stride(0), bmm_res.stride(1), bmm_res.stride(2),  #
             BLOCK_SIZE_M,
             is_split,
         )
-        packed_tensor = deploy.PackedQuantizedTensor(quant_res.reshape(B, -1), output_scale)
-    return packed_tensor
+        #packed_tensor = deploy.PackedQuantizedTensor(quant_res.reshape(B, -1), output_scale)
+    return bmm_res.view(B, -1)
 
 
 def benchmark(B, M, N, S, provider):
