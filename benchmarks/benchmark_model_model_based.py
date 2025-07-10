@@ -143,6 +143,7 @@ def rename_keys(checkpoint):
                  .replace("o_proj.act_quantizer", "o_proj.0") \
                  .replace("ln_trans.matrix_left", "inp_trans.left_matrix") \
                  .replace("ln_trans.matrix_right", "inp_trans.right_matrix") \
+                 .replace("ln_trans", "inp_trans") \
                  .replace("o_trans.matrix", "o_proj_trans.right_matrix") \
                  .replace("gate_proj.linear", "gate_proj") \
                  .replace("gate_proj.act_quantizer", "quantizer_g") \
@@ -151,9 +152,11 @@ def rename_keys(checkpoint):
                  .replace("down_proj.linear", "down_proj.2") \
                  .replace("down_proj.act_quantizer", "down_proj.1") \
                  .replace("down_trans.matrix_left", "down_proj.0.left_matrix") \
-                 .replace("down_trans.matrix_right", "down_proj.0.right_matrix") \
+                 .replace("down_trans.matrix_right", "down_proj.0.right_matrix")\
+                 .replace("down_trans", "down_proj.0") \
                  .replace("up_gate_trans.matrix_left", "inp_trans.left_matrix") \
                  .replace("up_gate_trans.matrix_right", "inp_trans.right_matrix") \
+                 .replace("up_gate_trans", "inp_trans") \
                  .replace("k_cache_quantizer.clip", "kclip") \
                  .replace("v_cache_quantizer.clip", "vclip") \
                  .replace("kcache_trans.matrix", "trans_matrix_k") \
@@ -189,7 +192,6 @@ def get_model_quantized(args, config_name, checkpoint_path = None):
         print(f"Keys missing in both model_state_dict and quantizers: {len(missing_keys_both)}")
         for k in sorted(missing_keys_both):
             print(f"{k}")
-
     torch.set_default_dtype(dtype_old)
     return model
 
@@ -298,7 +300,7 @@ def benchmark(args):
         test_data = load_dataset(config_name = config_name)
         print(f"Loaded dataset")
 
-        # FP16
+        """# FP16
         args.fuseLN, args.trans = False, "none"
         args.online_trans = set()
         #print_gpu_memory("before load model")
@@ -364,7 +366,7 @@ def benchmark(args):
         print(f"test-inference time: {time_i4:.3f} +- {1.96 * std_i4:.3f}ms per sequence")
         print(f"Speedup: {speedup_i4:.3f}x Speedup loss: {(speedup_i4_benchmark - speedup_i4):.3f}")
         print(f"Perplexity: {ppl_i4:.3f}")
-        print(f"Perplexity degradation: {ppl_i4 / ppl_f16:.3f}")
+        print(f"Perplexity degradation: {ppl_i4 / ppl_f16:.3f}")"""
             
         # FlatQuant
         args.fuseLN, args.trans = False, "matmul"
@@ -384,15 +386,15 @@ def benchmark(args):
             ppl_i4, time_i4, std_i4 = ppl_eval(model = model, testenc = test_data)
             del model
             _cleanup()
-            print_e2e_time(args, time_prefill_i4, time_decode_i4, time_e2e_i4,
+            """print_e2e_time(args, time_prefill_i4, time_decode_i4, time_e2e_i4,
                            time_prefill_f16, time_decode_f16, time_e2e_f16,
-                           time_prefill_i4_benchmark, time_decode_i4_benchmark, time_e2e_i4_benchmark)
+                           time_prefill_i4_benchmark, time_decode_i4_benchmark, time_e2e_i4_benchmark)"""
             
-            speedup_i4 = time_f16 / time_i4
+            #speedup_i4 = time_f16 / time_i4
             print(f"test-inference time: {time_i4:.3f} +- {1.96 * std_i4:.3f}ms per sequence")
-            print(f"Speedup: {speedup_i4:.3f}x Speedup loss: {(speedup_i4_benchmark - speedup_i4):.3f}")
+            #print(f"Speedup: {speedup_i4:.3f}x Speedup loss: {(speedup_i4_benchmark - speedup_i4):.3f}")
             print(f"Perplexity: {ppl_i4:.3f}")
-            print(f"Perplexity degradation: {ppl_i4 / ppl_f16:.3f}")
+            #print(f"Perplexity degradation: {ppl_i4 / ppl_f16:.3f}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

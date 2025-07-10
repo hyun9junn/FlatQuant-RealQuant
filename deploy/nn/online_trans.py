@@ -37,6 +37,8 @@ class OnlineTrans(torch.nn.Module):
                 right_matrix = torch.randn([right_size, right_size], dtype=torch.float16)
                 self.register_buffer("left_matrix", left_matrix)
                 self.register_buffer("right_matrix", right_matrix)
+                #import pdb; pdb.set_trace()
+                self.register_buffer("diag_scale", torch.randn([trans_dim], dtype=torch.float16)) # need diag_scale product
             else:
                 right_matrix = torch.randn([trans_dim, trans_dim], dtype=torch.float16)
                 self.register_buffer("right_matrix", right_matrix)
@@ -54,6 +56,8 @@ class OnlineTrans(torch.nn.Module):
             x = deploy.functional.matmul_hadU_cuda(x, self.had_rem_dim, self.rem_dim)
         elif self.trans == "matmul":
             invs = []
+            if hasattr(self, "diag_scale"):
+                x = x * self.diag_scale # diag_scale product
             if hasattr(self, "left_matrix"):
                 invs.append(self.left_matrix)
             if hasattr(self, "right_matrix"):
