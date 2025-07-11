@@ -45,12 +45,14 @@ def asym_quantize_and_pack_i4(x: torch.Tensor, clip_factor_a_max: torch.Tensor, 
     return q, scale, zero
 
 
-def unpack_i4_and_asym_dequantize(q, scale, zero):
+def unpack_i4_and_asym_dequantize(q, scale, zero, lac: bool = False):
     #unpack int4
     assert q.dtype == torch.uint8
     q = torch.stack((q & 0x0f, (q >> 4) & 0x0f), dim=-1).view(*q.shape[:-1], q.shape[-1] * 2)
-    print("unpack!!")
-    return q * scale - zero
+    if lac:
+        return scale * (q - zero)
+    else:
+        return q * scale - zero
 
 
 def matmul_had_cuda(X, dtype):
@@ -139,23 +141,44 @@ class _AttentionStub(object):
 
     def forward(self, q, num_kv_heads, attention_kwargs, layer_idx):
         batch_size, q_len, num_qo_heads, head_dim = q.shape
-        assert q_len == 1
-        q = q.view(batch_size, num_qo_heads, head_dim)
+
+        is_decode = (q_len == 1)
+
+        if is_decode:
+            q = q.view(batch_size, num_qo_heads, head_dim)
+        else:
+            pass
+
         if self.trans_dtype is not None:
-            if self.head_dim is None:
-                q = matmul_had_cuda(q, dtype=self.trans_dtype) 
+            if is_decode:
+                if self.head_dim is None:
+                    q = matmul_had_cuda(q, dtype=self.trans_dtype) 
+                else:
+                    q = torch.matmul(q.to(self.trans_dtype), self.head_dim) ## trans for q
+                    print("trans_q")
             else:
-                q = torch.matmul(q.to(self.trans_dtype), self.head_dim) ## trans for q
+                original_shape = q.shape
+                if self.head_dim is None:
+                    q = q.reshape(-1, head_dim)
+                    q = matmul_had_cuda(q, dtype = self.trans_dtype)
+                    q = q.reshape(original_shape)
+                else:
+                    q = torch.matmul(q.to(self.trans_dtype), self.head_dim)
+                    print("trans_q")
+
         attn_output = torch.empty_like(q)
         if self.disable_quant:
             batch_decode = batch_decode_f16
         else:
             batch_decode = batch_decode_i4
+        if is_decode:
+            q = q.unsqueeze(1)
+            attn_output = attn_output.unsqueeze(1)
         batch_decode(
             attn_output, q, 
             **attention_kwargs, layer_idx=layer_idx
         )
-        attn_output = attn_output.unsqueeze(1)
+        #attn_output = attn_output.unsqueeze(1)
         return attn_output
 
 
@@ -240,22 +263,20 @@ class MultiLayerPagedKVCache4Bit(Cache):
 
         orig_key_states = key_states
         orig_value_states = value_states
-
         if self.trans_dtype is not None:
             if self.head_dim is None:
                 key_states = matmul_had_cuda(key_states, dtype=self.trans_dtype)
             else:
                 key_states = torch.matmul(key_states.to(self.trans_dtype), self.head_dim) ## trans for k / need for v
-                value_states = torch.matmul(key_states.to(self.trans_dtype), self.trans_matrix_v)
-
+                #value_states = torch.matmul(key_states.to(self.trans_dtype), self.trans_matrix_v)
         if self.disable_quant:
             k_scale = key_states.new_ones((b_sz, added_length, num_heads, 1))
             k_zero = key_states.new_zeros((b_sz, added_length, num_heads, 1))
             v_scale = value_states.new_ones((b_sz, added_length, num_heads, 1))
             v_zero = value_states.new_zeros((b_sz, added_length, num_heads, 1))
         else:
-            self.kclip_factor_a_max, self.kclip_factor_a_max = torch.sigmoid(self.kclip_factor_a_max), torch.sigmoid(self.kclip_factor_a_max)
-            self.vclip_factor_a_max, self.vclip_factor_a_max = torch.sigmoid(self.vclip_factor_a_max), torch.sigmoid(self.vclip_factor_a_max)
+            self.kclip_factor_a_max, self.kclip_factor_a_min = torch.sigmoid(self.kclip_factor_a_max), torch.sigmoid(self.kclip_factor_a_min)
+            self.vclip_factor_a_max, self.vclip_factor_a_min = torch.sigmoid(self.vclip_factor_a_max), torch.sigmoid(self.vclip_factor_a_min)
             if self.trans.startswith("matmul"):
                 self.lac = True
             else:
@@ -303,7 +324,21 @@ class MultiLayerPagedKVCache4Bit(Cache):
                 seqlen_indptr=seqlens_in_batch,
                 layer_idx=layer_idx
             )
-            return orig_key_states, orig_value_states
+            use_kernel_for_prefill = False
+            if use_kernel_for_prefill:
+                return functools.partial(
+                self._stub.forward, 
+                num_kv_heads=num_heads,
+                attention_kwargs=self.get_cache_specs_for_flash_infer(attention_mask),
+                layer_idx=layer_idx, 
+                )
+            else:
+                if key_states.dtype == torch.uint8:
+                    key_states_f16 = unpack_i4_and_asym_dequantize(key_states, k_scale, k_zero, lac = True)
+                    value_states_f16 = unpack_i4_and_asym_dequantize(value_states, v_scale, v_zero, lac = True)
+                    return key_states_f16, value_states_f16
+                else:
+                    return orig_key_states, orig_value_states
         else:
             assert added_length == 1
             append_kv = append_kv_f16 if self.disable_quant else append_kv_i4

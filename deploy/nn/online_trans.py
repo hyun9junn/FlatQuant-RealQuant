@@ -57,10 +57,11 @@ class OnlineTrans(torch.nn.Module):
         elif self.trans == "matmul":
             invs = []
             if hasattr(self, "diag_scale"):
-                x = x * self.diag_scale # diag_scale product
+                x = x #* self.diag_scale # diag_scale product
             if hasattr(self, "left_matrix"):
                 invs.append(self.left_matrix)
             if hasattr(self, "right_matrix"):
                 invs.append(self.right_matrix)
+            #import pdb; pdb.set_trace()
             x = deploy.functional.online_trans.kronecker_matmul(x, invs)
         return x

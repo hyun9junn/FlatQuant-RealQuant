@@ -63,7 +63,6 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
         kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids, unsqueeze_dim=2)
-
         past_key_value = getattr(self, "past_key_value", past_key_value)
         assert past_key_value is not None
         # sin and cos are specific to RoPE models; position_ids needed for the static cache
@@ -77,7 +76,6 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
             "attention_mask": attention_mask,
         })
         cache_out = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-        
 
         dropout_rate = self.attention_dropout if self.training else 0.0
 
@@ -85,6 +83,9 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
 
         if isinstance(cache_out, tuple):
             key_states, value_states = cache_out
+            trans_mat_for_q = cache_kwargs.get("trans_matrix_k_inv_t")
+            if trans_mat_for_q is not None:
+                query_states = torch.matmul(query_states.to(torch.float16), trans_mat_for_q) # hard-cording for trans dtype
             attn_output = self._flash_attention_forward(
                 query_states, 
                 key_states, 
@@ -94,12 +95,11 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
             )
         else:
             attn_output = cache_out(query_states)
-
         if isinstance(self.o_proj_trans, deploy.nn.OnlineTrans) and self.o_proj_trans.trans == "matmul":
             # attn_output: (bsz, seq_len, num_heads, head_dim)
             attn_output = self.o_proj_trans(attn_output.transpose(-1, -2).contiguous())
-            attn_output.quantized_x = attn_output.quantized_x.transpose(-1, -2)
-            attn_output.quantized_x = attn_output.quantized_x.reshape(bsz, q_len, -1).contiguous()
+            attn_output = attn_output.reshape(bsz, q_len, self.head_dim, -1)
+            attn_output = attn_output.transpose(-1, -2).contiguous().reshape(bsz, q_len, -1)
         else:
             attn_output = self.o_proj_trans(attn_output.transpose(-1, -2)).transpose(-1, -2)
             attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
@@ -107,7 +107,6 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
 
         if not output_attentions:
             attn_weights = None
-
         return attn_output, attn_weights, past_key_value
 
 

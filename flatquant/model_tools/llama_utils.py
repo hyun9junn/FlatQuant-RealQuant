@@ -258,7 +258,6 @@ class FlatQuantLlamaAttention(LlamaAttention):
                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
                 f" {attn_output.size()}"
             )
-
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
         if self._ori_mode:
@@ -274,14 +273,13 @@ class FlatQuantLlamaAttention(LlamaAttention):
             else:
                 init_shape = attn_output.shape
                 attn_output = attn_output.reshape(-1, self.config.num_attention_heads, self.config.hidden_size//self.config.num_attention_heads)
-                attn_output = torch.matmul(self.o_trans.get_matrix().T.to(attn_output), attn_output).reshape(init_shape)
+                attn_output = torch.matmul(self.o_trans.get_matrix().T.to(attn_output), attn_output).reshape(init_shape) ###
                 if not self._eval_mode:
                     attn_o_og_it = self.o_trans.get_matrix(inv_t=True)
                     attn_v_og_it = self.vcache_trans.get_matrix(inv_t=True)
                     attn_output = self.o_proj(attn_output, qa_trans=[attn_o_og_it, attn_v_og_it])
                 else:
-                    attn_output = self.o_proj(attn_output)
-
+                    attn_output = self.o_proj(attn_output) ###
         if not output_attentions:
             attn_weights = None
         return attn_output, attn_weights, past_key_value

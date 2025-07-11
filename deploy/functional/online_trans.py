@@ -85,13 +85,19 @@ def kronecker_matmul(x, invs):
         x = kron_matmul(invL, x, invR, seq_len)
         #x.quantized_x = x.quantized_x.reshape(bsz, seq_len, -1)
         #x.scales_x = x.scales_x.reshape(bsz, 1, seq_len)
+        x = x.reshape(bsz, seq_len, -1)
     elif len(invs) == 1:
         bsz, seq_len, head_dim, num_heads = init_shape
         inv = invs[0]
+        #inv = inv.T.contiguous()
+        #print("inv.T!!")
         x = x.reshape(-1, head_dim, num_heads)
+        (x @ inv).contiguous()
+        
         x = block_matmul(x, inv, seq_len)
         #x.quantized_x = x.quantized_x.reshape(bsz, seq_len, -1, num_heads)
         #x.scales_x = x.scales_x.reshape(bsz, 1, seq_len)
+        x = x.reshape(bsz, seq_len, -1)
     else:
         raise NotImplementedError
     return x
