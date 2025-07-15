@@ -47,11 +47,9 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
         hidden_states_q = self.quantizer_q(hidden_states) ## TODO have to apply lac for qkv each other
         hidden_states_k = self.quantizer_k(hidden_states)
         hidden_states_v = self.quantizer_v(hidden_states)
-
         query_states = self.q_proj(hidden_states_q)
         key_states = self.k_proj(hidden_states_k)
         value_states = self.v_proj(hidden_states_v)
-
         # Flash attention requires the input to have the shape
         # batch_size x seq_length x head_dim x hidden_dim
         # therefore we just need to keep the original shape
@@ -66,7 +64,6 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
         past_key_value = getattr(self, "past_key_value", past_key_value)
         assert past_key_value is not None
         # sin and cos are specific to RoPE models; position_ids needed for the static cache
-        
         if cache_kwargs is None:
             cache_kwargs = {}
         cache_kwargs.update({
@@ -212,7 +209,8 @@ class FlatQuantLlamaMLP(LlamaMLP):
             x = self.inp_trans(x)
         x_up = self.up_proj(self.quantizer_u(x))
         x_gate = self.gate_proj(self.quantizer_g(x))
-        x = x_up * self.act_fn(x_gate)
+        ac = self.act_fn(x_gate)
+        x = x_up * ac
         x = self.down_proj(x)
         return x
 

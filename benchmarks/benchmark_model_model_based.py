@@ -178,7 +178,7 @@ def get_model_quantized(args, config_name, checkpoint_path = None):
     )
     dtype_old = torch.get_default_dtype()
     torch.set_default_dtype(torch.float16)
-    with transformers.modeling_utils.no_init_weights(): 
+    with transformers.modeling_utils.no_init_weights():
         model = modeling_llama.FlatQuantLlamaForCausalLM(args=args, config=config)
     if checkpoint_path:
         checkpoint = torch.load(checkpoint_path, weights_only = False)
@@ -251,7 +251,6 @@ def _wait_for_input():
 
 @torch.no_grad
 def run_all_for_model(model, bsz, prefill, decode):
-    return 0,0,0,0
     model.eval()
     model = model.cuda()
     time_prefill, _ = run_prefill(model, bsz, prefill)
@@ -268,7 +267,6 @@ def run_all_for_model(model, bsz, prefill, decode):
 
 def print_e2e_time(args, time_prefill_i4, time_decode_i4, time_e2e_i4, time_prefill_f16, time_decode_f16, time_e2e_f16,
                    time_prefill_i4_benchmark=None, time_decode_i4_benchmark=None, time_e2e_i4_benchmark=None):
-    return
     prefill_speedup = np.mean(time_prefill_f16) / np.mean(time_prefill_i4)
     prefill_benchmark_speedup = np.mean(time_prefill_f16) / np.mean(time_prefill_i4_benchmark) if time_prefill_i4_benchmark is not None else None
     print(f"Prefill time: {np.mean(time_prefill_i4):.3f} +- {1.96 * np.std(time_prefill_i4):.3f}ms\n"
@@ -300,7 +298,7 @@ def benchmark(args):
         test_data = load_dataset(config_name = config_name)
         print(f"Loaded dataset")
 
-        """# FP16
+        # FP16
         args.fuseLN, args.trans = False, "none"
         args.online_trans = set()
         #print_gpu_memory("before load model")
@@ -366,7 +364,7 @@ def benchmark(args):
         print(f"test-inference time: {time_i4:.3f} +- {1.96 * std_i4:.3f}ms per sequence")
         print(f"Speedup: {speedup_i4:.3f}x Speedup loss: {(speedup_i4_benchmark - speedup_i4):.3f}")
         print(f"Perplexity: {ppl_i4:.3f}")
-        print(f"Perplexity degradation: {ppl_i4 / ppl_f16:.3f}")"""
+        print(f"Perplexity degradation: {ppl_i4 / ppl_f16:.3f}")
             
         # FlatQuant
         args.fuseLN, args.trans = False, "matmul"
@@ -386,15 +384,15 @@ def benchmark(args):
             ppl_i4, time_i4, std_i4 = ppl_eval(model = model, testenc = test_data)
             del model
             _cleanup()
-            """print_e2e_time(args, time_prefill_i4, time_decode_i4, time_e2e_i4,
+            print_e2e_time(args, time_prefill_i4, time_decode_i4, time_e2e_i4,
                            time_prefill_f16, time_decode_f16, time_e2e_f16,
-                           time_prefill_i4_benchmark, time_decode_i4_benchmark, time_e2e_i4_benchmark)"""
+                           time_prefill_i4_benchmark, time_decode_i4_benchmark, time_e2e_i4_benchmark)
             
-            #speedup_i4 = time_f16 / time_i4
+            speedup_i4 = time_f16 / time_i4
             print(f"test-inference time: {time_i4:.3f} +- {1.96 * std_i4:.3f}ms per sequence")
-            #print(f"Speedup: {speedup_i4:.3f}x Speedup loss: {(speedup_i4_benchmark - speedup_i4):.3f}")
+            print(f"Speedup: {speedup_i4:.3f}x Speedup loss: {(speedup_i4_benchmark - speedup_i4):.3f}")
             print(f"Perplexity: {ppl_i4:.3f}")
-            #print(f"Perplexity degradation: {ppl_i4 / ppl_f16:.3f}")
+            print(f"Perplexity degradation: {ppl_i4 / ppl_f16:.3f}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
