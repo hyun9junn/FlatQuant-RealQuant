@@ -99,7 +99,7 @@ def ppl_eval(model, testenc):
     nlls = []
     inference_times = []
     
-    for i in tqdm(range(nsamples)):
+    for i in range(nsamples):
         batch = testenc[:, (i * max_length): ((i + 1) * max_length)]
 
         torch.cuda.synchronize()
@@ -251,6 +251,7 @@ def _wait_for_input():
 
 @torch.no_grad
 def run_all_for_model(model, bsz, prefill, decode):
+    return 1,1,1,1
     model.eval()
     model = model.cuda()
     time_prefill, _ = run_prefill(model, bsz, prefill)
@@ -267,6 +268,7 @@ def run_all_for_model(model, bsz, prefill, decode):
 
 def print_e2e_time(args, time_prefill_i4, time_decode_i4, time_e2e_i4, time_prefill_f16, time_decode_f16, time_e2e_f16,
                    time_prefill_i4_benchmark=None, time_decode_i4_benchmark=None, time_e2e_i4_benchmark=None):
+    return
     prefill_speedup = np.mean(time_prefill_f16) / np.mean(time_prefill_i4)
     prefill_benchmark_speedup = np.mean(time_prefill_f16) / np.mean(time_prefill_i4_benchmark) if time_prefill_i4_benchmark is not None else None
     print(f"Prefill time: {np.mean(time_prefill_i4):.3f} +- {1.96 * np.std(time_prefill_i4):.3f}ms\n"

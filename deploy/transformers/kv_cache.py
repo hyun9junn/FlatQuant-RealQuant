@@ -9,7 +9,7 @@ from deploy.functional.quantization import get_minq_maxq
 
 
 @torch.jit.script
-def asym_quantize_and_pack_i4(x: torch.Tensor, clip_factor_a_max: torch.Tensor, clip_factor_a_min: torch.Tensor, lac: bool = False): ## TODO cache quantizer 적용
+def asym_quantize_and_pack_i4(x: torch.Tensor, clip_factor_a_max: torch.Tensor, clip_factor_a_min: torch.Tensor, lac: bool = False, quantize: bool = True): ## TODO cache quantizer 적용
     minq, maxq = get_minq_maxq(bits=4, sym=False)
     xmax = torch.amax(x, dim=-1, keepdim=True)
     xmin = torch.amin(x, dim=-1, keepdim=True)
@@ -34,10 +34,16 @@ def asym_quantize_and_pack_i4(x: torch.Tensor, clip_factor_a_max: torch.Tensor, 
         zero = torch.round((-1.0 * xmin) / scale)
         q = torch.clamp((x / scale).round() + zero, 0, maxq)
 
+        if not quantize:
+            return scale * (q - zero), scale, zero
+
     else:
         scale = ((xmax - xmin).clamp(min=1e-5) / maxq)
         zero = -xmin
         q = torch.clamp(torch.round((x + zero) / scale), 0, maxq)
+
+        if not quantize:
+            return scale * (q - zero), scale, zero
 
     # pack int4
     q = q.to(dtype=torch.uint8)
@@ -281,6 +287,8 @@ class MultiLayerPagedKVCache4Bit(Cache):
                 self.lac = True
             else:
                 self.lac = False
+            key_states_lac_only, _, _ = asym_quantize_and_pack_i4(key_states, clip_factor_a_max = self.kclip_factor_a_max, clip_factor_a_min = self.kclip_factor_a_min, lac = self.lac, quantize = False)
+            value_states_lac_only, _, _ = asym_quantize_and_pack_i4(value_states, clip_factor_a_max = self.vclip_factor_a_max, clip_factor_a_min = self.vclip_factor_a_min, lac = self.lac, quantize = False)
             key_states, k_scale, k_zero = asym_quantize_and_pack_i4(key_states, clip_factor_a_max = self.kclip_factor_a_max, clip_factor_a_min = self.kclip_factor_a_min, lac = self.lac)
             value_states, v_scale, v_zero = asym_quantize_and_pack_i4(value_states, clip_factor_a_max = self.vclip_factor_a_max, clip_factor_a_min = self.vclip_factor_a_min, lac = self.lac)
         
@@ -333,10 +341,8 @@ class MultiLayerPagedKVCache4Bit(Cache):
                 layer_idx=layer_idx, 
                 )
             else:
-                if key_states.dtype == torch.uint8:
-                    key_states_f16 = unpack_i4_and_asym_dequantize(key_states, k_scale, k_zero, lac = True)
-                    value_states_f16 = unpack_i4_and_asym_dequantize(value_states, v_scale, v_zero, lac = True)
-                    return key_states_f16, value_states_f16
+                if key_states.dtype == torch.uint8 and self.trans.startswith("matmul"):
+                    return key_states_lac_only, value_states_lac_only
                 else:
                     return orig_key_states, orig_value_states
         else:
