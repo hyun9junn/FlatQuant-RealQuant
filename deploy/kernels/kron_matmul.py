@@ -208,11 +208,11 @@ def kron_matmul(a, b, c, seq_len, clip_factor_a_max, clip_factor_a_min):
     quant_res = torch.empty((B, M, N // 2), device=a.device, dtype=torch.uint8)
     bmm_res = torch.empty((B, M, N), device=a.device, dtype=a.dtype)
 
-    if isinstance(clip_factor_a_max, torch.Tensor):
+    """if isinstance(clip_factor_a_max, torch.Tensor):
         clip_factor_a_max = clip_factor_a_max.item()
             
     if isinstance(clip_factor_a_min, torch.Tensor):
-        clip_factor_a_min = clip_factor_a_min.item()
+        clip_factor_a_min = clip_factor_a_min.item()"""
 
     if is_split:
         # 2 x bmm

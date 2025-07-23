@@ -260,11 +260,11 @@ def block_matmul(b, c, seq_len, clip_factor_a_max, clip_factor_a_min):
         )
         return bmm_res.view(B, -1)
     else:
-        if isinstance(clip_factor_a_max, torch.Tensor):
+        """if isinstance(clip_factor_a_max, torch.Tensor):
             clip_factor_a_max = clip_factor_a_max.item()
             
         if isinstance(clip_factor_a_min, torch.Tensor):
-            clip_factor_a_min = clip_factor_a_min.item()
+            clip_factor_a_min = clip_factor_a_min.item()"""
 
         if FUSION:
             grid = (1, seq_len, Actual_B)
