@@ -21,10 +21,13 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.quantizer_q = torch.nn.Identity()
-        self.quantizer_k = torch.nn.Identity()
-        self.quantizer_v = torch.nn.Identity()
-        self.inp_trans = torch.nn.Identity()
+        #self.quantizer_q = torch.nn.Identity()
+        #self.quantizer_k = torch.nn.Identity()
+        #self.quantizer_v = torch.nn.Identity()
+        #self.inp_trans = torch.nn.Identity()
+        self.inp_trans_q = torch.nn.Identity()
+        self.inp_trans_k = torch.nn.Identity()
+        self.inp_trans_v = torch.nn.Identity()
         self.o_proj_trans = torch.nn.Identity()
 
     def forward(
@@ -43,10 +46,13 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
 
         bsz, q_len, _ = hidden_states.size()
 
-        hidden_states = self.inp_trans(hidden_states)
-        hidden_states_q = self.quantizer_q(hidden_states) ## TODO have to apply lac for qkv each other
-        hidden_states_k = self.quantizer_k(hidden_states)
-        hidden_states_v = self.quantizer_v(hidden_states)
+        #hidden_states = self.inp_trans(hidden_states)
+        hidden_states_q = self.inp_trans_q(hidden_states) ## TODO have to apply lac for qkv each other
+        hidden_states_k = self.inp_trans_k(hidden_states)
+        hidden_states_v = self.inp_trans_v(hidden_states)
+        #hidden_states_q = self.quantizer_q(hidden_states) ## TODO have to apply lac for qkv each other
+        #hidden_states_k = self.quantizer_k(hidden_states)
+        #hidden_states_v = self.quantizer_v(hidden_states)
         query_states = self.q_proj(hidden_states_q)
         key_states = self.k_proj(hidden_states_k)
         value_states = self.v_proj(hidden_states_v)
@@ -95,13 +101,12 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
         if isinstance(self.o_proj_trans, deploy.nn.OnlineTrans) and self.o_proj_trans.trans == "matmul":
             # attn_output: (bsz, seq_len, num_heads, head_dim)
             attn_output = self.o_proj_trans(attn_output.transpose(-1, -2).contiguous())
-            attn_output = attn_output.reshape(bsz, q_len, self.head_dim, -1)
-            attn_output = attn_output.transpose(-1, -2).contiguous().reshape(bsz, q_len, -1)
+            #attn_output.quantized_x = attn_output.quantized_x.reshape(bsz, q_len, self.head_dim, -1)
+            attn_output.quantized_x = attn_output.quantized_x.contiguous().reshape(bsz, q_len, -1)
         else:
             attn_output = self.o_proj_trans(attn_output.transpose(-1, -2)).transpose(-1, -2)
             attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
         attn_output = self.o_proj(attn_output)
-
         if not output_attentions:
             attn_weights = None
         return attn_output, attn_weights, past_key_value
@@ -114,9 +119,9 @@ class FlatQuantLlamaAttention(FlatQuantFP16LlamaAttention):
         use_lac = hasattr(options, 'trans') and options.trans == "matmul" # if doing FlatQuant
 
         self.options = options
-        self.quantizer_q = deploy.nn.Quantizer(lac = use_lac)
-        self.quantizer_k = deploy.nn.Quantizer(lac = use_lac)
-        self.quantizer_v = deploy.nn.Quantizer(lac = use_lac)
+        #self.quantizer_q = deploy.nn.Quantizer(lac = use_lac)
+        #self.quantizer_k = deploy.nn.Quantizer(lac = use_lac)
+        #self.quantizer_v = deploy.nn.Quantizer(lac = use_lac)
         self.q_proj = deploy.nn.Linear4bit.from_float(self.q_proj)
         self.k_proj = deploy.nn.Linear4bit.from_float(self.k_proj)
         self.v_proj = deploy.nn.Linear4bit.from_float(self.v_proj)
@@ -128,7 +133,9 @@ class FlatQuantLlamaAttention(FlatQuantFP16LlamaAttention):
         )
         if "qkv_proj" in self.options.online_trans:
             if not self.options.fuseLN:
-                self.inp_trans = deploy.nn.OnlineTrans(self.hidden_size, trans=options.trans)
+                self.inp_trans_q = deploy.nn.OnlineTrans(self.hidden_size, trans=options.trans)
+                self.inp_trans_k = deploy.nn.OnlineTrans(self.hidden_size, trans=options.trans)
+                self.inp_trans_v = deploy.nn.OnlineTrans(self.hidden_size, trans=options.trans)
         
         num_heads = self.config.num_key_value_heads
         model_dim = self.config.hidden_size
@@ -142,6 +149,9 @@ class FlatQuantLlamaAttention(FlatQuantFP16LlamaAttention):
         self.register_buffer("vclip_factor_a_max", torch.tensor(4.0))
         self.register_buffer("vclip_factor_a_min", torch.tensor(4.0))
 
+        self.register_buffer("left_matrix", torch.randn([64, 64], requires_grad = False)) # hard coding..
+        self.register_buffer("right_matrix", torch.randn([64, 64], requires_grad = False))
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -153,7 +163,7 @@ class FlatQuantLlamaAttention(FlatQuantFP16LlamaAttention):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        
+
         cache_kwargs = {
             "sin": kwargs.get("sin"),
             "cos": kwargs.get("cos"),
@@ -185,8 +195,8 @@ class FlatQuantLlamaMLP(LlamaMLP):
         use_lac = hasattr(options, 'trans') and options.trans == "matmul" # if doing FlatQuant
 
         self.options = options
-        self.quantizer_g = deploy.nn.Quantizer(lac = use_lac) ## TODO 여기서도 새로 지정
-        self.quantizer_u = deploy.nn.Quantizer(lac = use_lac)
+        #self.quantizer_g = deploy.nn.Quantizer(lac = use_lac) ## TODO 여기서도 새로 지정
+        #self.quantizer_u = deploy.nn.Quantizer(lac = use_lac)
         self.up_proj = deploy.nn.Linear4bit.from_float(self.up_proj)
         self.gate_proj = deploy.nn.Linear4bit.from_float(self.gate_proj)
         if "down_proj" in self.options.online_trans:
@@ -202,13 +212,23 @@ class FlatQuantLlamaMLP(LlamaMLP):
             )
         if "up_gate_proj" in self.options.online_trans:
             if not self.options.fuseLN:
-                self.inp_trans = deploy.nn.OnlineTrans(self.hidden_size, trans=options.trans)
+                #self.inp_trans = deploy.nn.OnlineTrans(self.hidden_size, trans=options.trans)
+                self.inp_trans_g = deploy.nn.OnlineTrans(self.hidden_size, trans=options.trans)
+                self.inp_trans_u = deploy.nn.OnlineTrans(self.hidden_size, trans=options.trans)
+        
+        self.register_buffer("left_matrix", torch.randn([64, 64], requires_grad = False)) # hard coding..
+        self.register_buffer("right_matrix", torch.randn([64, 64], requires_grad = False))
 
     def forward(self, x):            
-        if not self.options.fuseLN and hasattr(self, "inp_trans"):
-            x = self.inp_trans(x)
-        x_up = self.up_proj(self.quantizer_u(x))
-        x_gate = self.gate_proj(self.quantizer_g(x))
+        if not self.options.fuseLN and hasattr(self, "inp_trans_g"):
+            #x = self.inp_trans(x)
+            x_up = self.up_proj(self.inp_trans_u(x))
+            x_gate = self.gate_proj(self.inp_trans_g(x))
+        else:
+            x_up = self.up_proj(x)
+            x_gate = self.gate_proj(x)
+        #x_up = self.up_proj(self.quantizer_u(x))
+        #x_gate = self.gate_proj(self.quantizer_g(x))
         ac = self.act_fn(x_gate)
         x = x_up * ac
         x = self.down_proj(x)

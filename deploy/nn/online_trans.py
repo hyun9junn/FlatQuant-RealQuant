@@ -16,7 +16,7 @@ def get_decompose_dim(n):
 
 
 class OnlineTrans(torch.nn.Module):
-    def __init__(self, trans_dim, force_fp32=False, trans="had", decompose=True):
+    def __init__(self, trans_dim, force_fp32=False, trans="had", decompose=True, lac = False):
         super().__init__()
         self.fp32_trans = force_fp32
         self.trans = trans
@@ -49,6 +49,10 @@ class OnlineTrans(torch.nn.Module):
             # else:
             #     self.right_matrix = torch.nn.Parameter(torch.randn([trans_dim, trans_dim], dtype=torch.float16), requires_grad=True)
 
+        self.lac = lac
+        self.register_buffer("clip_factor_a_max", torch.tensor(1.0))
+        self.register_buffer("clip_factor_a_min", torch.tensor(1.0))
+
     def forward(self, x):
         if self.fp32_trans:
             x = x.float()
@@ -63,5 +67,5 @@ class OnlineTrans(torch.nn.Module):
             if hasattr(self, "right_matrix"):
                 invs.append(self.right_matrix)
             #import pdb; pdb.set_trace()
-            x = deploy.functional.online_trans.kronecker_matmul(x, invs)
+            x = deploy.functional.online_trans.kronecker_matmul(x, invs, self.clip_factor_a_max, self.clip_factor_a_min)
         return x
