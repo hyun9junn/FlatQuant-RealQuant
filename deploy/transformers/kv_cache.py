@@ -287,10 +287,12 @@ class MultiLayerPagedKVCache4Bit(Cache):
                 self.lac = True
             else:
                 self.lac = False
-            key_states_lac_only, _, _ = asym_quantize_and_pack_i4(key_states, clip_factor_a_max = self.kclip_factor_a_max, clip_factor_a_min = self.kclip_factor_a_min, lac = self.lac, quantize = False)
-            value_states_lac_only, _, _ = asym_quantize_and_pack_i4(value_states, clip_factor_a_max = self.vclip_factor_a_max, clip_factor_a_min = self.vclip_factor_a_min, lac = self.lac, quantize = False)
-            key_states, k_scale, k_zero = asym_quantize_and_pack_i4(key_states, clip_factor_a_max = self.kclip_factor_a_max, clip_factor_a_min = self.kclip_factor_a_min, lac = self.lac)
-            value_states, v_scale, v_zero = asym_quantize_and_pack_i4(value_states, clip_factor_a_max = self.vclip_factor_a_max, clip_factor_a_min = self.vclip_factor_a_min, lac = self.lac)
+            orig_key_states = key_states
+            orig_value_states = value_states
+            # key_states_lac_only, _, _ = asym_quantize_and_pack_i4(key_states, clip_factor_a_max = self.kclip_factor_a_max, clip_factor_a_min = self.kclip_factor_a_min, lac = self.lac, quantize = False) # if we wants to use quant-dequant, use it
+            # value_states_lac_only, _, _ = asym_quantize_and_pack_i4(value_states, clip_factor_a_max = self.vclip_factor_a_max, clip_factor_a_min = self.vclip_factor_a_min, lac = self.lac, quantize = False)
+            key_states, k_scale, k_zero = asym_quantize_and_pack_i4(key_states, clip_factor_a_max = self.kclip_factor_a_max, clip_factor_a_min = self.kclip_factor_a_min) # lac = false 
+            value_states, v_scale, v_zero = asym_quantize_and_pack_i4(value_states, clip_factor_a_max = self.vclip_factor_a_max, clip_factor_a_min = self.vclip_factor_a_min)
         
         k_param = torch.cat([k_scale, k_zero], dim=-1).view(self.batch_size * added_length, num_heads, 2)
         v_param = torch.cat([v_scale, v_zero], dim=-1).view(self.batch_size * added_length, num_heads, 2)     
@@ -342,7 +344,7 @@ class MultiLayerPagedKVCache4Bit(Cache):
                 )
             else:
                 if key_states.dtype == torch.uint8 and self.trans.startswith("matmul"):
-                    return key_states_lac_only, value_states_lac_only
+                    return orig_key_states, orig_value_states #key_states_lac_only, value_states_lac_only
                 else:
                     return orig_key_states, orig_value_states
         else:

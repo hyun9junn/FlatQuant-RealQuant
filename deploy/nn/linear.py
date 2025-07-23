@@ -46,11 +46,9 @@ class Linear4bit(torch.nn.Module):
         #shape_handler = ShapeHandler(quantized_x)
         #quantized_x = shape_handler.flatten(quantized_x)
         x = deploy.matmul(x, self.weight)
-        margin = (1.0 - 5e-3)
-        max_val, min_val = torch.finfo(self.weight_scales.dtype).max * margin, torch.finfo(self.weight_scales.dtype).min * margin
-        max_val, min_val = int(max_val), int(min_val)
+        #max_val, min_val = 65176, -65176 # torch.finfo(self.weight_scales.dtype).max * (1.0 - 5e-3)
         #clip_count = ((x < min_val) | (x > max_val)).sum().item()
-        x = x.clamp_(min_val, max_val)
+        #x = x.clamp_(min_val, max_val)
         ##print(f"clip_count for dequant: {clip_count}")
         #out = shape_handler.unflatten(
         #    deploy.sym_dequant(int_result, scales_x, self.weight_scales))

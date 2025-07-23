@@ -21,9 +21,9 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        #self.quantizer_q = torch.nn.Identity()
-        #self.quantizer_k = torch.nn.Identity()
-        #self.quantizer_v = torch.nn.Identity()
+        self.quantizer_q = torch.nn.Identity()
+        self.quantizer_k = torch.nn.Identity()
+        self.quantizer_v = torch.nn.Identity()
         #self.inp_trans = torch.nn.Identity()
         self.inp_trans_q = torch.nn.Identity()
         self.inp_trans_k = torch.nn.Identity()
@@ -50,9 +50,9 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
         hidden_states_q = self.inp_trans_q(hidden_states) ## TODO have to apply lac for qkv each other
         hidden_states_k = self.inp_trans_k(hidden_states)
         hidden_states_v = self.inp_trans_v(hidden_states)
-        #hidden_states_q = self.quantizer_q(hidden_states) ## TODO have to apply lac for qkv each other
-        #hidden_states_k = self.quantizer_k(hidden_states)
-        #hidden_states_v = self.quantizer_v(hidden_states)
+        hidden_states_q = self.quantizer_q(hidden_states_q) ## TODO have to apply lac for qkv each other
+        hidden_states_k = self.quantizer_k(hidden_states_k)
+        hidden_states_v = self.quantizer_v(hidden_states_v)
         query_states = self.q_proj(hidden_states_q)
         key_states = self.k_proj(hidden_states_k)
         value_states = self.v_proj(hidden_states_v)
@@ -119,9 +119,9 @@ class FlatQuantLlamaAttention(FlatQuantFP16LlamaAttention):
         use_lac = hasattr(options, 'trans') and options.trans == "matmul" # if doing FlatQuant
 
         self.options = options
-        #self.quantizer_q = deploy.nn.Quantizer(lac = use_lac)
-        #self.quantizer_k = deploy.nn.Quantizer(lac = use_lac)
-        #self.quantizer_v = deploy.nn.Quantizer(lac = use_lac)
+        self.quantizer_q = deploy.nn.Quantizer(lac = use_lac)
+        self.quantizer_k = deploy.nn.Quantizer(lac = use_lac)
+        self.quantizer_v = deploy.nn.Quantizer(lac = use_lac)
         self.q_proj = deploy.nn.Linear4bit.from_float(self.q_proj)
         self.k_proj = deploy.nn.Linear4bit.from_float(self.k_proj)
         self.v_proj = deploy.nn.Linear4bit.from_float(self.v_proj)
@@ -195,8 +195,8 @@ class FlatQuantLlamaMLP(LlamaMLP):
         use_lac = hasattr(options, 'trans') and options.trans == "matmul" # if doing FlatQuant
 
         self.options = options
-        #self.quantizer_g = deploy.nn.Quantizer(lac = use_lac) ## TODO 여기서도 새로 지정
-        #self.quantizer_u = deploy.nn.Quantizer(lac = use_lac)
+        self.quantizer_g = deploy.nn.Quantizer(lac = use_lac) ## TODO 여기서도 새로 지정
+        self.quantizer_u = deploy.nn.Quantizer(lac = use_lac)
         self.up_proj = deploy.nn.Linear4bit.from_float(self.up_proj)
         self.gate_proj = deploy.nn.Linear4bit.from_float(self.gate_proj)
         if "down_proj" in self.options.online_trans:
@@ -225,8 +225,8 @@ class FlatQuantLlamaMLP(LlamaMLP):
             x_up = self.up_proj(self.inp_trans_u(x))
             x_gate = self.gate_proj(self.inp_trans_g(x))
         else:
-            x_up = self.up_proj(x)
-            x_gate = self.gate_proj(x)
+            x_up = self.up_proj(self.quantizer_u(x))
+            x_gate = self.gate_proj(self.quantizer_g(x))
         #x_up = self.up_proj(self.quantizer_u(x))
         #x_gate = self.gate_proj(self.quantizer_g(x))
         ac = self.act_fn(x_gate)

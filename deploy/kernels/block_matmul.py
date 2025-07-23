@@ -208,7 +208,8 @@ def quant_kernel(
     
     scale = tl.where(scale == 0.0, 1.0, scale)
 
-    quant_val = libdevice.llrint(src / scale)
+    src_T = tl.trans(src)
+    quant_val = libdevice.llrint(src_T / scale)
     quant_val = tl.maximum(-8, tl.minimum(quant_val, 7))
     quant_val = quant_val.reshape(np2_M,  np2_N // 2, 2, can_reorder=False)
     quant_val_even, quant_val_odd = quant_val.split()

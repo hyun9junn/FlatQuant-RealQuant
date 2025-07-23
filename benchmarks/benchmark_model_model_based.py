@@ -204,8 +204,8 @@ def get_model_quantized(args, config_name, checkpoint_path = None):
 
         missing_keys_both = set(missing_keys_1) & set(missing_keys_2)
         print(f"Keys missing in both model_state_dict and quantizers: {len(missing_keys_both)}")
-        for k in sorted(missing_keys_both):
-            print(f"{k}")
+        #for k in sorted(missing_keys_both):
+        #    print(f"{k}")
     torch.set_default_dtype(dtype_old)
     return model
 
@@ -314,7 +314,7 @@ def benchmark(args):
         test_data = load_dataset(config_name = config_name)
         print(f"Loaded dataset")
 
-        """# FP16
+        # FP16
         args.fuseLN, args.trans = False, "none"
         args.online_trans = set()
         #print_gpu_memory("before load model")
@@ -380,7 +380,7 @@ def benchmark(args):
         print(f"test-inference time: {time_i4:.3f} +- {1.96 * std_i4:.3f}ms per sequence")
         print(f"Speedup: {speedup_i4:.3f}x Speedup loss: {(speedup_i4_benchmark - speedup_i4):.3f}")
         print(f"Perplexity: {ppl_i4:.3f}")
-        print(f"Perplexity degradation: {ppl_i4 / ppl_f16:.3f}")"""
+        print(f"Perplexity degradation: {ppl_i4 / ppl_f16:.3f}")
             
         # FlatQuant
         args.fuseLN, args.trans = False, "matmul"
@@ -400,15 +400,15 @@ def benchmark(args):
             ppl_i4, time_i4, std_i4 = ppl_eval(model = model, testenc = test_data)
             del model
             _cleanup()
-            """print_e2e_time(args, time_prefill_i4, time_decode_i4, time_e2e_i4,
+            print_e2e_time(args, time_prefill_i4, time_decode_i4, time_e2e_i4,
                            time_prefill_f16, time_decode_f16, time_e2e_f16,
                            time_prefill_i4_benchmark, time_decode_i4_benchmark, time_e2e_i4_benchmark)
             
-            speedup_i4 = time_f16 / time_i4"""
+            speedup_i4 = time_f16 / time_i4
             print(f"test-inference time: {time_i4:.3f} +- {1.96 * std_i4:.3f}ms per sequence")
-            #print(f"Speedup: {speedup_i4:.3f}x Speedup loss: {(speedup_i4_benchmark - speedup_i4):.3f}")
+            print(f"Speedup: {speedup_i4:.3f}x Speedup loss: {(speedup_i4_benchmark - speedup_i4):.3f}")
             print(f"Perplexity: {ppl_i4:.3f}")
-            #print(f"Perplexity degradation: {ppl_i4 / ppl_f16:.3f}")
+            print(f"Perplexity degradation: {ppl_i4 / ppl_f16:.3f}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
