@@ -21,8 +21,12 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.quantizer = torch.nn.Identity()
-        self.inp_trans = torch.nn.Identity()
+        self.quantizer_q = torch.nn.Identity()
+        self.quantizer_k = torch.nn.Identity()
+        self.quantizer_v = torch.nn.Identity()
+        self.inp_trans_q = torch.nn.Identity()
+        self.inp_trans_k = torch.nn.Identity()
+        self.inp_trans_v = torch.nn.Identity()
         self.o_proj_trans = torch.nn.Identity()
 
     def forward(
@@ -34,19 +38,38 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
+        cache_kwargs = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         output_attentions = False
 
         bsz, q_len, _ = hidden_states.size()
+        
+        self.isFlatQ = False
+        if cache_kwargs is not None:
+            self.isFlatQ = cache_kwargs.get("isFlatQ", False)
 
-        hidden_states = self.inp_trans(hidden_states)
-        hidden_states = self.quantizer(hidden_states)
+        if self.isFlatQ:
+            #hidden_states = self.inp_trans(hidden_states)
+            hidden_states_q = self.inp_trans_q(hidden_states)
+            hidden_states_k = self.inp_trans_k(hidden_states)
+            hidden_states_v = self.inp_trans_v(hidden_states)
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+            hidden_states_q = self.quantizer_q(hidden_states_q)
+            hidden_states_k = self.quantizer_k(hidden_states_k)
+            hidden_states_v = self.quantizer_v(hidden_states_v)
+            
+            query_states = self.q_proj(hidden_states_q)
+            key_states = self.k_proj(hidden_states_k)
+            value_states = self.v_proj(hidden_states_v)
+        else:
+            hidden_states = self.inp_trans_q(hidden_states)
+            hidden_states = self.quantizer_q(hidden_states)
 
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
+            
         # Flash attention requires the input to have the shape
         # batch_size x seq_length x head_dim x hidden_dim
         # therefore we just need to keep the original shape
@@ -62,10 +85,15 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
         past_key_value = getattr(self, "past_key_value", past_key_value)
         assert past_key_value is not None
         # sin and cos are specific to RoPE models; position_ids needed for the static cache
-        
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position, "attention_mask": attention_mask}
+        if cache_kwargs is None:
+            cache_kwargs = {}
+        cache_kwargs.update({
+            "sin": sin,
+            "cos": cos,
+            "cache_position": cache_position,
+            "attention_mask": attention_mask,
+        })
         cache_out = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-        
 
         dropout_rate = self.attention_dropout if self.training else 0.0
 
@@ -73,6 +101,9 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
 
         if isinstance(cache_out, tuple):
             key_states, value_states = cache_out
+            trans_mat_for_q = cache_kwargs.get("trans_matrix_k_inv_t")
+            if trans_mat_for_q is not None:
+                query_states = torch.matmul(query_states.to(torch.float16), trans_mat_for_q) # trans for q TODO: fix hard-coded trans dtype
             attn_output = self._flash_attention_forward(
                 query_states, 
                 key_states, 
@@ -86,8 +117,7 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
         if isinstance(self.o_proj_trans, deploy.nn.OnlineTrans) and self.o_proj_trans.trans == "matmul":
             # attn_output: (bsz, seq_len, num_heads, head_dim)
             attn_output = self.o_proj_trans(attn_output.transpose(-1, -2).contiguous())
-            attn_output.quantized_x = attn_output.quantized_x.transpose(-1, -2)
-            attn_output.quantized_x = attn_output.quantized_x.reshape(bsz, q_len, -1).contiguous()
+            attn_output.quantized_x = attn_output.quantized_x.contiguous().reshape(bsz, q_len, -1)
         else:
             attn_output = self.o_proj_trans(attn_output.transpose(-1, -2)).transpose(-1, -2)
             attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
@@ -103,49 +133,122 @@ class FlatQuantLlamaAttention(FlatQuantFP16LlamaAttention):
 
     def __init__(self, options, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.isFlatQ = hasattr(options, 'trans') and options.trans == "matmul" # if doing FlatQuant
+
         self.options = options
-        self.quantizer = deploy.nn.Quantizer()
+        self.quantizer_q = deploy.nn.Quantizer(lac = self.isFlatQ)
+        self.quantizer_k = deploy.nn.Quantizer(lac = self.isFlatQ)
+        self.quantizer_v = deploy.nn.Quantizer(lac = self.isFlatQ)
         self.q_proj = deploy.nn.Linear4bit.from_float(self.q_proj)
         self.k_proj = deploy.nn.Linear4bit.from_float(self.k_proj)
         self.v_proj = deploy.nn.Linear4bit.from_float(self.v_proj)
         if "o_proj" in self.options.online_trans:
             self.o_proj_trans = deploy.nn.OnlineTrans(self.num_heads, trans=options.trans, decompose=False)
         self.o_proj = torch.nn.Sequential(
-            deploy.nn.Quantizer(),
+            deploy.nn.Quantizer(lac = self.isFlatQ),
             deploy.nn.Linear4bit.from_float(self.o_proj)
         )
         if "qkv_proj" in self.options.online_trans:
             if not self.options.fuseLN:
-                self.inp_trans = deploy.nn.OnlineTrans(self.hidden_size, trans=options.trans)
+                self.inp_trans_q = deploy.nn.OnlineTrans(self.hidden_size, trans=options.trans)
+                self.inp_trans_k = deploy.nn.OnlineTrans(self.hidden_size, trans=options.trans)
+                self.inp_trans_v = deploy.nn.OnlineTrans(self.hidden_size, trans=options.trans)
+        
+        num_heads = self.config.num_attention_heads
+        model_dim = self.config.hidden_size
+        head_dim = model_dim // num_heads
 
+        self.register_buffer("trans_matrix_k", torch.randn([head_dim, head_dim], requires_grad = False))
+        self.register_buffer("trans_matrix_k_inv_t", torch.randn([head_dim, head_dim], requires_grad = False))
+        self.register_buffer("trans_matrix_v", torch.randn([head_dim, head_dim], requires_grad = False))
+        self.register_buffer("kclip_factor_a_max", torch.tensor(4.0))
+        self.register_buffer("kclip_factor_a_min", torch.tensor(4.0))
+        self.register_buffer("vclip_factor_a_max", torch.tensor(4.0))
+        self.register_buffer("vclip_factor_a_min", torch.tensor(4.0))
+
+        self.register_buffer("left_matrix", torch.randn([64, 64], requires_grad = False)) # TODO: fix hard coded trans matrix size
+        self.register_buffer("right_matrix", torch.randn([64, 64], requires_grad = False))
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+
+        cache_kwargs = {
+            "sin": kwargs.get("sin"),
+            "cos": kwargs.get("cos"),
+            "cache_position": cache_position,
+            "attention_mask": attention_mask,
+            "trans_matrix_k": self.trans_matrix_k,
+            "trans_matrix_k_inv_t": self.trans_matrix_k_inv_t,
+            "trans_matrix_v": self.trans_matrix_v,
+            "kclip_factor_a_max": self.kclip_factor_a_max,
+            "kclip_factor_a_min": self.kclip_factor_a_min,
+            "vclip_factor_a_max": self.vclip_factor_a_max,
+            "vclip_factor_a_min": self.vclip_factor_a_min,
+            "isFlatQ": self.isFlatQ,
+        }
+
+        return super().forward(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            cache_kwargs=cache_kwargs,
+        )
 
 class FlatQuantLlamaMLP(LlamaMLP):
     def __init__(self, options, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.isFlatQ = hasattr(options, 'trans') and options.trans == "matmul" # if doing FlatQuant
+
         self.options = options
-        self.quantizer = deploy.nn.Quantizer()
+        self.quantizer_g = deploy.nn.Quantizer(lac = self.isFlatQ)
+        self.quantizer_u = deploy.nn.Quantizer(lac = self.isFlatQ)
         self.up_proj = deploy.nn.Linear4bit.from_float(self.up_proj)
         self.gate_proj = deploy.nn.Linear4bit.from_float(self.gate_proj)
         if "down_proj" in self.options.online_trans:
             self.down_proj = torch.nn.Sequential(
                 deploy.nn.OnlineTrans(self.intermediate_size, trans=options.trans),
-                deploy.nn.Quantizer(),
+                deploy.nn.Quantizer(lac = self.isFlatQ),
                 deploy.nn.Linear4bit.from_float(self.down_proj)
             )
         else:
             self.down_proj = torch.nn.Sequential(
-                deploy.nn.Quantizer(),
+                deploy.nn.Quantizer(lac = self.isFlatQ),
                 deploy.nn.Linear4bit.from_float(self.down_proj)
             )
         if "up_gate_proj" in self.options.online_trans:
             if not self.options.fuseLN:
-                self.inp_trans = deploy.nn.OnlineTrans(self.hidden_size, trans=options.trans)
+                self.inp_trans_g = deploy.nn.OnlineTrans(self.hidden_size, trans=options.trans)
+                self.inp_trans_u = deploy.nn.OnlineTrans(self.hidden_size, trans=options.trans)
+        
+        self.register_buffer("left_matrix", torch.randn([64, 64], requires_grad = False)) # TODO: fix hard coded trans matrix size
+        self.register_buffer("right_matrix", torch.randn([64, 64], requires_grad = False))
 
     def forward(self, x):            
-        if not self.options.fuseLN and hasattr(self, "inp_trans"):
-            x = self.inp_trans(x)
-        x = self.quantizer(x)
-        return super().forward(x)
+        if not self.options.fuseLN and hasattr(self, "inp_trans_g"): # isFlatQ
+            x_up = self.up_proj(self.inp_trans_u(x))
+            x_gate = self.gate_proj(self.inp_trans_g(x))
+        else:
+            x = self.quantizer_g(x)
+            x_up = self.up_proj(x)
+            x_gate = self.gate_proj(x)
+        
+        ac = self.act_fn(x_gate)
+        x = x_up * ac
+        x = self.down_proj(x)
+        return x
 
 
 class FlatQuantFP16LlamaForCausalLM(LlamaForCausalLM):
@@ -159,6 +262,9 @@ class FlatQuantFP16LlamaForCausalLM(LlamaForCausalLM):
         if args is not None:
             self.trans = args.trans
             self.online_trans = args.online_trans
+        else:
+            self.trans = "none"
+            self.online_trans = set()
         
     def build_cache(self, batch_size, page_size, max_length):
         device = self.model.layers[0].self_attn.v_proj.weight.device
@@ -166,7 +272,7 @@ class FlatQuantFP16LlamaForCausalLM(LlamaForCausalLM):
         
         num_heads = self.config.num_key_value_heads
         model_dim = self.config.hidden_size
-        head_dim = model_dim // num_heads
+        head_dim = model_dim // self.config.num_attention_heads
         disable_quant = self.cache_dtype == "float16" 
         return deploy.transformers.MultiLayerPagedKVCache4Bit(
             batch_size=batch_size,

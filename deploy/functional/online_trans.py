@@ -75,20 +75,21 @@ def get_hadK(n, transpose=False):
 #     return x.reshape(init_shape)
 
 
-def kronecker_matmul(x, invs):
+def kronecker_matmul(x, invs, clip_factor_a_max = 1.0, clip_factor_a_min = 1.0):
     init_shape = x.shape
     if len(invs) == 2:
         bsz, seq_len, hidden_dim = init_shape
         invL, invR = invs
+        invL = invL.T.contiguous()
         x = x.reshape(-1, invL.shape[0], invR.shape[0])
-        x = kron_matmul(invL, x, invR, seq_len)
+        x = kron_matmul(invL, x, invR, seq_len, clip_factor_a_max, clip_factor_a_min)
         x.quantized_x = x.quantized_x.reshape(bsz, seq_len, -1)
         x.scales_x = x.scales_x.reshape(bsz, 1, seq_len)
     elif len(invs) == 1:
         bsz, seq_len, head_dim, num_heads = init_shape
         inv = invs[0]
         x = x.reshape(-1, head_dim, num_heads)
-        x = block_matmul(x, inv, seq_len)
+        x = block_matmul(x, inv, seq_len, clip_factor_a_max, clip_factor_a_min)
         x.quantized_x = x.quantized_x.reshape(bsz, seq_len, -1, num_heads)
         x.scales_x = x.scales_x.reshape(bsz, 1, seq_len)
     else:

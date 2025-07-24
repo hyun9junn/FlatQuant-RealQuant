@@ -144,6 +144,10 @@ def parser_gen():
         action="store_true",
         help="Distribute the model across multiple GPUs for evaluation.")
 
+    # Add quantized_save flag
+    parser.add_argument('--quantized_save', action = "store_true", default = False,
+                        help = 'Save the quantized model checkpoint.')
+
     args = parser.parse_args()
     if args.a_groupsize > -1:
         raise NotImplementedError
