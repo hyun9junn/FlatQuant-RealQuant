@@ -1,3 +1,11 @@
+import sys
+import os
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+
+
 import functools
 import deploy
 import deploy.transformers
@@ -73,9 +81,10 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
         # Flash attention requires the input to have the shape
         # batch_size x seq_length x head_dim x hidden_dim
         # therefore we just need to keep the original shape
+        group_size = self.num_heads // self.num_key_value_heads
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).repeat_interleave(group_size, dim=2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).repeat_interleave(group_size, dim=2)
 
         kv_seq_len = key_states.shape[1]
         kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
@@ -270,7 +279,7 @@ class FlatQuantFP16LlamaForCausalLM(LlamaForCausalLM):
         device = self.model.layers[0].self_attn.v_proj.weight.device
         dtype = self.cache_dtype or self.model.layers[0].self_attn.v_proj.weight.dtype
         
-        num_heads = self.config.num_key_value_heads
+        num_heads = self.config.num_attention_heads
         model_dim = self.config.hidden_size
         head_dim = model_dim // self.config.num_attention_heads
         disable_quant = self.cache_dtype == "float16" 
@@ -320,3 +329,107 @@ class FlatQuantLlamaForCausalLM(FlatQuantFP16LlamaForCausalLM):
                 layer.post_attention_layernorm = deploy.nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             layer.mlp = FlatQuantLlamaMLP(options=args, config=config)
         self.cache_dtype = "int4"
+
+        
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name, **kwargs):
+        import os
+        import torch
+        from huggingface_hub import hf_hub_download
+
+        dtype_old = torch.get_default_dtype()
+        torch.set_default_dtype(torch.float16)
+
+        config = cls.config_class.from_pretrained(pretrained_model_name, **kwargs)
+        config._attn_implementation = "flash_attention_2"
+        quant_config = getattr(config, 'quantization_config', {})
+
+        class Args:
+            pass
+
+        args = Args()
+        args.fuseLN = quant_config.get('fuseLN', False)
+        args.trans = quant_config.get('trans', "matmul")
+        args.online_trans = quant_config.get('online_trans', ["qk", "o_proj", "down_proj", "qkv_proj", "up_gate_proj"])
+        args.online_trans = set(args.online_trans)
+
+        model = cls(args, config)
+
+        if os.path.isdir(pretrained_model_name):
+            pth_path = os.path.join(pretrained_model_name, "quantized_weights.pth")
+        else:
+            pth_path = hf_hub_download(
+                repo_id = pretrained_model_name,
+                filename="quantized_weights.pth"
+            )
+
+        checkpoint = torch.load(pth_path, map_location="cpu", weights_only = False)
+
+        new_checkpoint = {
+            "model_state_dict": {},
+            "quantizers": {}
+        }
+        for k, v in checkpoint["model_state_dict"].items():
+            new_k = k.replace("q_proj.linear", "q_proj") \
+                    .replace("q_proj.act_quantizer", "inp_trans_q") \
+                    .replace("k_proj.linear", "k_proj") \
+                    .replace("k_proj.act_quantizer", "inp_trans_k") \
+                    .replace("v_proj.linear", "v_proj") \
+                    .replace("v_proj.act_quantizer", "inp_trans_v") \
+                    .replace("o_proj.linear", "o_proj.1") \
+                    .replace("o_proj.act_quantizer", "o_proj_trans") \
+                    .replace("ln_trans.matrix_left", "left_matrix") \
+                    .replace("ln_trans.matrix_right", "right_matrix") \
+                    .replace("ln_trans", "inp_trans_k") \
+                    .replace("o_trans.matrix", "o_proj_trans.right_matrix") \
+                    .replace("gate_proj.linear", "gate_proj") \
+                    .replace("gate_proj.act_quantizer", "inp_trans_g") \
+                    .replace("up_proj.linear", "up_proj") \
+                    .replace("up_proj.act_quantizer", "inp_trans_u") \
+                    .replace("down_proj.linear", "down_proj.2") \
+                    .replace("down_proj.act_quantizer", "down_proj.0") \
+                    .replace("down_trans.matrix_left", "down_proj.0.left_matrix") \
+                    .replace("down_trans.matrix_right", "down_proj.0.right_matrix")\
+                    .replace("down_trans", "down_proj.0") \
+                    .replace("up_gate_trans.matrix_left", "left_matrix") \
+                    .replace("up_gate_trans.matrix_right", "right_matrix") \
+                    .replace("up_gate_trans", "inp_trans_g") \
+                    .replace("k_cache_quantizer.clip", "kclip") \
+                    .replace("v_cache_quantizer.clip", "vclip") \
+                    .replace("kcache_trans.matrix", "trans_matrix_k") \
+                    .replace("vcache_trans.matrix", "trans_matrix_v")
+            new_checkpoint["model_state_dict"][new_k] = v
+        
+        for k, v in checkpoint["quantizers"].items():
+            new_k = k.replace("linear", "weight_scales") \
+                    .replace("mlp.down_proj.weight_scales", "mlp.down_proj.2.weight_scales") \
+                    .replace("self_attn.o_proj.weight_scales", "self_attn.o_proj.1.weight_scales")
+            new_checkpoint["quantizers"][new_k] = v.scale
+
+        model.load_state_dict(new_checkpoint["model_state_dict"], strict = False)
+        model.load_state_dict(new_checkpoint["quantizers"], strict = False)
+
+        for layer in model.model.layers:    
+            layer.self_attn.inp_trans_q.register_buffer("left_matrix", layer.self_attn.left_matrix)
+            layer.self_attn.inp_trans_k.register_buffer("left_matrix", layer.self_attn.left_matrix)
+            layer.self_attn.inp_trans_v.register_buffer("left_matrix", layer.self_attn.left_matrix)
+            layer.self_attn.inp_trans_q.register_buffer("right_matrix", layer.self_attn.right_matrix)
+            layer.self_attn.inp_trans_k.register_buffer("right_matrix", layer.self_attn.right_matrix)
+            layer.self_attn.inp_trans_v.register_buffer("right_matrix", layer.self_attn.right_matrix)
+
+            layer.mlp.inp_trans_u.register_buffer("left_matrix", layer.mlp.left_matrix)
+            layer.mlp.inp_trans_u.register_buffer("right_matrix", layer.mlp.right_matrix)
+            layer.mlp.inp_trans_g.register_buffer("left_matrix", layer.mlp.left_matrix)
+            layer.mlp.inp_trans_g.register_buffer("right_matrix", layer.mlp.right_matrix)
+
+        for name, module in model.named_modules():
+            for attr_name in ['clip_factor_a_max', 'clip_factor_a_min']:
+                if hasattr(module, attr_name):
+                    attr_value = getattr(module, attr_name)
+                    if isinstance(attr_value, torch.Tensor):
+                        delattr(module, attr_name)
+                        setattr(module, attr_name, attr_value.item())
+
+        torch.set_default_dtype(dtype_old)
+
+        return model
