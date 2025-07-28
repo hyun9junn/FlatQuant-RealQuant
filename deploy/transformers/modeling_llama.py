@@ -83,8 +83,8 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
         # therefore we just need to keep the original shape
         group_size = self.num_heads // self.num_key_value_heads
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).repeat_interleave(group_size, dim=2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).repeat_interleave(group_size, dim=2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
 
         kv_seq_len = key_states.shape[1]
         kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
@@ -282,6 +282,7 @@ class FlatQuantFP16LlamaForCausalLM(LlamaForCausalLM):
         num_heads = self.config.num_attention_heads
         model_dim = self.config.hidden_size
         head_dim = model_dim // self.config.num_attention_heads
+        group_size = num_heads // self.config.num_key_value_heads
         disable_quant = self.cache_dtype == "float16" 
         return deploy.transformers.MultiLayerPagedKVCache4Bit(
             batch_size=batch_size,
@@ -294,6 +295,7 @@ class FlatQuantFP16LlamaForCausalLM(LlamaForCausalLM):
             disable_quant=disable_quant,
             trans_dtype=None if disable_quant else torch.float16,
             trans=self.trans if "qk" in self.online_trans else "none",
+            group_size = group_size
         )
 
     def _get_logits_processor(self, generation_config, *args, **kwargs):

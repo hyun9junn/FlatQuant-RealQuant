@@ -172,7 +172,7 @@ class MultiLayerPagedKVCache4Bit(Cache):
         self, batch_size, page_size, max_seq_len, 
         device, n_layers, num_heads, head_dim, 
         disable_quant=False, trans_dtype=torch.float16,
-        trans="had"):
+        trans="had", group_size = 1):
         self.page_size = page_size
         self.batch_size = batch_size
         max_page_cnt = self.page_cnt_from_length(max_seq_len)
@@ -198,6 +198,7 @@ class MultiLayerPagedKVCache4Bit(Cache):
         self.device = device
         self.trans_dtype = trans_dtype
         self.n_layers = n_layers
+        self.group_size = group_size
 
     def page_cnt_from_length(self, length):
         return (length + self.page_size - 1) // self.page_size
@@ -272,8 +273,15 @@ class MultiLayerPagedKVCache4Bit(Cache):
             key_states, k_scale, k_zero = asym_quantize_and_pack_i4(key_states, clip_factor_a_max = self.kclip_factor_a_max, clip_factor_a_min = self.kclip_factor_a_min) # lac = false / if we wnats to use lac for cached kv, use lac = True
             value_states, v_scale, v_zero = asym_quantize_and_pack_i4(value_states, clip_factor_a_max = self.vclip_factor_a_max, clip_factor_a_min = self.vclip_factor_a_min)
         
-        k_param = torch.cat([k_scale, k_zero], dim=-1).view(self.batch_size * added_length, num_heads, 2)
-        v_param = torch.cat([v_scale, v_zero], dim=-1).view(self.batch_size * added_length, num_heads, 2)     
+        if self.group_size > 1:
+            # Repeat the quantized states
+            key_states = key_states.repeat_interleave(self.group_size, dim = 2)
+            value_states = value_states.repeat_interleave(self.group_size, dim = 2)
+            # Update num_heads to match after repeat
+            num_heads = num_heads * self.group_size
+        
+        k_param = torch.cat([k_scale, k_zero], dim=-1).repeat_interleave(self.group_size, dim = -2).view(self.batch_size * added_length, num_heads, 2)
+        v_param = torch.cat([v_scale, v_zero], dim=-1).repeat_interleave(self.group_size, dim = -2).view(self.batch_size * added_length, num_heads, 2)
 
         quantized_head_dim = self.pages.shape[-1]
 
