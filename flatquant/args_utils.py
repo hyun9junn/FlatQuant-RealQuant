@@ -15,6 +15,7 @@ supported_models = [
             './modelzoo/llama-3.1/llama-3.1-8b',
             './modelzoo/llama-3.1/llama-3.1-70b',
             './modelzoo/llama-3.1-instruct/llama-3.1-instruct-8b',
+            './modelzoo/llama-3-instruct/llama-3-instruct-8b',
             './modelzoo/qwen-2.5-instruct/qwen-2.5-instruct-7b',
             './modelzoo/qwen-2.5-instruct/qwen-2.5-instruct-32b',
             ]
@@ -143,6 +144,10 @@ def parser_gen():
         "--distribute_model",
         action="store_true",
         help="Distribute the model across multiple GPUs for evaluation.")
+
+    # Add quantized_save flag
+    parser.add_argument('--quantized_save', action = "store_true", default = False,
+                        help = 'Save the quantized model checkpoint.')
 
     args = parser.parse_args()
     if args.a_groupsize > -1:
