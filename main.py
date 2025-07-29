@@ -49,7 +49,7 @@ def main():
 
     ## save quantized weight
     if args.quantized_save:
-        flat_utils.save_quantized_weights(args, model, quantizers)
+        flat_utils.save_quantized_weights_with_safetensors(args, model, quantizers)
 
     if args.distribute_model:
         utils.distribute_model(model)

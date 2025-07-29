@@ -338,6 +338,9 @@ class FlatQuantLlamaForCausalLM(FlatQuantFP16LlamaForCausalLM):
         import os
         import torch
         from huggingface_hub import hf_hub_download
+        from safetensors.torch import load_file
+        from safetensors import safe_open
+        import json
 
         dtype_old = torch.get_default_dtype()
         torch.set_default_dtype(torch.float16)
@@ -357,15 +360,52 @@ class FlatQuantLlamaForCausalLM(FlatQuantFP16LlamaForCausalLM):
 
         model = cls(args, config)
 
-        if os.path.isdir(pretrained_model_name):
-            pth_path = os.path.join(pretrained_model_name, "quantized_weights.pth")
-        else:
-            pth_path = hf_hub_download(
-                repo_id = pretrained_model_name,
-                filename="quantized_weights.pth"
-            )
+        state_dict = {}
 
-        checkpoint = torch.load(pth_path, map_location="cpu", weights_only = False)
+        if os.path.isdir(pretrained_model_name):
+            index_path = os.path.join(pretrained_model_name, "quantized_model.safetensors.index.json")
+            single_path = os.path.join(pretrained_model_name, "quantized_model.safetensors")
+
+            if os.path.exists(index_path):
+                # Sharded model
+                with open(index_path, 'r') as f:
+                    index = json.load(f)
+                
+                loaded_files = set()
+                for tensor_name, filename in index["weight_map"].items():
+                    if filename not in loaded_files:
+                        shard_path = os.path.join(pretrained_model_name, filename)
+                        with safe_open(shard_path, framework="pt") as f:
+                            for key in f.keys():
+                                if key in index["weight_map"] and index["weight_map"][key] == filename:
+                                    state_dict[key] = f.get_tensor(key)
+                        loaded_files.add(filename)
+                        print(f"Loaded {filename}")
+            else:
+                # Single file
+                state_dict = load_file(single_path)
+
+    
+        # Reconstruct the checkpoint format from safetensors
+        checkpoint = {
+            "model_state_dict": {},
+            "quantizers": {}
+        }
+        
+        for k, v in state_dict.items():
+            if k.startswith("quantizer."):
+                parts = k.split(".")
+                layer_name = ".".join(parts[1:-1])
+                param_type = parts[-1]
+                
+                if param_type == "scale":
+                    if layer_name not in checkpoint["quantizers"]:
+                        class Quantize:
+                            pass
+                        checkpoint["quantizers"][layer_name] = Quantize()
+                    checkpoint["quantizers"][layer_name].scale = v
+            else:
+                checkpoint["model_state_dict"][k] = v
 
         new_checkpoint = {
             "model_state_dict": {},

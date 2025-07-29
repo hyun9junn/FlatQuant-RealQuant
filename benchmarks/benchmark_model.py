@@ -4,10 +4,13 @@ import pprint
 import numpy as np
 import torch
 import time
+import os
 
 import deploy.transformers.modeling_llama as modeling_llama
 import torch
 import transformers
+from safetensors.torch import load_file
+import json
 
 import flatquant.data_utils as data_utils
 from tqdm import tqdm
@@ -16,6 +19,7 @@ model_configs = [
     "./modelzoo/llama-2/llama-2-7b",
     # "./modelzoo/llama-2-13b",
     #"./modelzoo/llama-3/llama-3-8b", 
+    #"./modelzoo/llama-3-instruct/llama-3-instruct-8b"
 ]
 
 benchmark_dtypes = ["int4", torch.float16]
@@ -120,6 +124,63 @@ def ppl_eval(model, testenc):
 
     return ppl.item(), avg_time, std_time
 
+# Load from safetensors format
+def load_from_safetensors(checkpoint_path):
+
+    from safetensors import safe_open
+    from safetensors.torch import load_file
+
+    state_dict = {}
+    
+    if os.path.isdir(checkpoint_path):
+        # Check for index file (sharded model)
+        index_path = os.path.join(checkpoint_path, "quantized_model.safetensors.index.json")
+        single_path = os.path.join(checkpoint_path, "quantized_model.safetensors")
+        
+        if os.path.exists(index_path):
+            # Sharded model - load index
+            with open(index_path, 'r') as f:
+                index = json.load(f)
+            
+            # Load all shards
+            loaded_files = set()
+            
+            for tensor_name, filename in index["weight_map"].items():
+                if filename not in loaded_files:
+                    shard_path = os.path.join(checkpoint_path, filename)
+                    with safe_open(shard_path, framework="pt") as f:
+                        for key in f.keys():
+                            if key in index["weight_map"] and index["weight_map"][key] == filename:
+                                state_dict[key] = f.get_tensor(key)
+                    loaded_files.add(filename)
+            
+        else:
+            # Single file
+            state_dict = load_file(single_path)
+    
+    # Reconstruct the checkpoint format from safetensors
+    checkpoint = {
+        "model_state_dict": {},
+        "quantizers": {}
+    }
+    
+    for k, v in state_dict.items():
+        if k.startswith("quantizer."):
+            parts = k.split(".")
+            layer_name = ".".join(parts[1:-1])
+            param_type = parts[-1]
+            
+            if param_type == "scale":
+                if layer_name not in checkpoint["quantizers"]:
+                    class Quantizer:
+                        pass
+                    checkpoint["quantizers"][layer_name] = Quantizer()
+                checkpoint["quantizers"][layer_name].scale = v
+        else:
+            checkpoint["model_state_dict"][k] = v
+    
+    return checkpoint
+
 # rename parameters for loading
 def rename_keys(checkpoint):
     new_checkpoint = {
@@ -175,7 +236,7 @@ def get_model_quantized(args, config_name, checkpoint_path = None):
     with transformers.modeling_utils.no_init_weights():
         model = modeling_llama.FlatQuantLlamaForCausalLM(args=args, config=config)
     if checkpoint_path:
-        checkpoint = torch.load(checkpoint_path, weights_only = False)
+        checkpoint = load_from_safetensors(checkpoint_path)
         new_checkpoint = rename_keys(checkpoint = checkpoint)
         missing_keys_1, unexpected_keys_1 = model.load_state_dict(new_checkpoint["model_state_dict"], strict=False)
         missing_keys_2, unexpected_keys_2  = model.load_state_dict(new_checkpoint['quantizers'], strict = False)
@@ -398,8 +459,9 @@ def benchmark(args):
             args.online_trans = online_trans
             import os
             model_name = os.path.basename(config_name)
-            weight_path = os.path.join(".", "outputs", model_name, "w4a4", "exp", "quantized_weights.pth")
-            model = get_model_quantized(args, config_name, weight_path)
+            weight_dir = os.path.join(".", "outputs", model_name, "w4a4", "exp")
+
+            model = get_model_quantized(args, config_name, weight_dir)
 
             if args.random_mode:
                 time_prefill_i4, time_decode_i4, time_e2e_i4, mem_i4 = run_all_for_model(
