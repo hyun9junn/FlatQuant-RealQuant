@@ -4,6 +4,18 @@ from deploy.kernels.kron_matmul import kron_matmul
 from deploy.kernels.block_matmul import block_matmul
 # Adapted from https://github.com/Cornell-RelaxML/quip-sharp/blob/main/lib/utils/matmul_had.py
 
+def get_decompose_dim(n):
+    a = int(math.sqrt(n))
+    if a * a < n:
+        a += 1
+    while True:
+        tmp = a*a - n
+        b = int(math.sqrt(tmp))
+        if b * b == tmp:
+            break
+        a += 1
+    return a - b, a + b
+
 
 def get_hadK(n, transpose=False):
     hadK, K = None, None

@@ -9,6 +9,7 @@ if current_dir not in sys.path:
 import functools
 import deploy
 import deploy.transformers
+from deploy.functional import get_decompose_dim
 import torch
 from transformers import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaAttention, \
@@ -175,8 +176,10 @@ class FlatQuantLlamaAttention(FlatQuantFP16LlamaAttention):
         self.register_buffer("vclip_factor_a_max", torch.tensor(4.0))
         self.register_buffer("vclip_factor_a_min", torch.tensor(4.0))
 
-        self.register_buffer("left_matrix", torch.randn([64, 64], requires_grad = False)) # TODO: fix hard coded trans matrix size
-        self.register_buffer("right_matrix", torch.randn([64, 64], requires_grad = False))
+
+        left_dim, right_dim = get_decompose_dim(self.config.hidden_size)
+        self.register_buffer("left_matrix", torch.randn([left_dim, left_dim], requires_grad = False))
+        self.register_buffer("right_matrix", torch.randn([right_dim, right_dim], requires_grad = False))
 
     def forward(
         self,
@@ -242,8 +245,9 @@ class FlatQuantLlamaMLP(LlamaMLP):
                 self.inp_trans_g = deploy.nn.OnlineTrans(self.hidden_size, trans=options.trans)
                 self.inp_trans_u = deploy.nn.OnlineTrans(self.hidden_size, trans=options.trans)
         
-        self.register_buffer("left_matrix", torch.randn([64, 64], requires_grad = False)) # TODO: fix hard coded trans matrix size
-        self.register_buffer("right_matrix", torch.randn([64, 64], requires_grad = False))
+        left_dim, right_dim = get_decompose_dim(self.config.hidden_size)
+        self.register_buffer("left_matrix", torch.randn([left_dim, left_dim], requires_grad = False))
+        self.register_buffer("right_matrix", torch.randn([right_dim, right_dim], requires_grad = False))
 
     def forward(self, x):            
         if not self.options.fuseLN and hasattr(self, "inp_trans_g"): # isFlatQ
@@ -363,8 +367,8 @@ class FlatQuantLlamaForCausalLM(FlatQuantFP16LlamaForCausalLM):
         state_dict = {}
 
         if os.path.isdir(pretrained_model_name):
-            index_path = os.path.join(pretrained_model_name, "quantized_model.safetensors.index.json")
-            single_path = os.path.join(pretrained_model_name, "quantized_model.safetensors")
+            index_path = os.path.join(pretrained_model_name, "model.safetensors.index.json")
+            single_path = os.path.join(pretrained_model_name, "model.safetensors")
 
             if os.path.exists(index_path):
                 # Sharded model
@@ -375,7 +379,7 @@ class FlatQuantLlamaForCausalLM(FlatQuantFP16LlamaForCausalLM):
                 for tensor_name, filename in index["weight_map"].items():
                     if filename not in loaded_files:
                         shard_path = os.path.join(pretrained_model_name, filename)
-                        with safe_open(shard_path, framework="pt") as f:
+                        with safe_open(shard_path, framework = "pt") as f:
                             for key in f.keys():
                                 if key in index["weight_map"] and index["weight_map"][key] == filename:
                                     state_dict[key] = f.get_tensor(key)
@@ -384,7 +388,43 @@ class FlatQuantLlamaForCausalLM(FlatQuantFP16LlamaForCausalLM):
             else:
                 # Single file
                 state_dict = load_file(single_path)
-
+        else:
+            # Download from HuggingFace repo
+            try:
+                index_path = hf_hub_download(
+                    repo_id=pretrained_model_name,
+                    filename="model.safetensors.index.json"
+                )
+                
+                # Sharded model - HF
+                with open(index_path, 'r') as f:
+                    index = json.load(f)
+                
+                loaded_files = set()
+                for tensor_name, filename in index["weight_map"].items():
+                    if filename not in loaded_files:
+                        shard_path = hf_hub_download(
+                            repo_id=pretrained_model_name,
+                            filename=filename
+                        )
+                        with safe_open(shard_path, framework = "pt") as f:
+                            for key in f.keys():
+                                if key in index["weight_map"] and index["weight_map"][key] == filename:
+                                    state_dict[key] = f.get_tensor(key)
+                        loaded_files.add(filename)
+                        print(f"Downloaded and loaded {filename}")
+                        
+            except Exception as e:
+                # Single file
+                try:
+                    single_path = hf_hub_download(
+                        repo_id=pretrained_model_name,
+                        filename="model.safetensors",
+                    )
+                    state_dict = load_file(single_path)
+                    print("Downloaded and loaded model.safetensors")
+                except Exception as e2:
+                    raise RuntimeError(f"Failed to load model weights: {e2}")
     
         # Reconstruct the checkpoint format from safetensors
         checkpoint = {

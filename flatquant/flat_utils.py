@@ -148,7 +148,7 @@ def save_quantized_weights_with_safetensors(args, model, quantizers, sym = True)
     state_dict_split = split_torch_state_dict_into_shards(
         state_dict, 
         max_shard_size = max_shard_size,
-        filename_pattern = "quantized_model{suffix}.safetensors"
+        filename_pattern = "model{suffix}.safetensors"
     )
 
     save_dir = args.exp_dir
@@ -187,7 +187,7 @@ def save_quantized_weights_with_safetensors(args, model, quantizers, sym = True)
             "metadata": state_dict_split.metadata if hasattr(state_dict_split, 'metadata') else {},
             "weight_map": state_dict_split.tensor_to_filename
         }
-        index_path = os.path.join(save_dir, "quantized_model.safetensors.index.json")
+        index_path = os.path.join(save_dir, "model.safetensors.index.json")
         with open(index_path, "w") as f:
             json.dump(index, f, indent = 2)
         print(f"Saved index to {index_path}")
