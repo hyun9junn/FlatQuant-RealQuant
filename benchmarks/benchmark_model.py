@@ -16,10 +16,10 @@ import flatquant.data_utils as data_utils
 from tqdm import tqdm
 
 model_configs = [
-    "./modelzoo/llama-2/llama-2-7b",
-    # "./modelzoo/llama-2-13b",
+    # "./modelzoo/llama-2-hf/llama-2-7b-hf",
+    "./modelzoo/llama-2-hf/llama-2-13b-hf",
     #"./modelzoo/llama-3/llama-3-8b", 
-    #"./modelzoo/llama-3-instruct/llama-3-instruct-8b"
+    #"./modelzoo/llama-3-instruct/llama-3-8b-instruct"
 ]
 
 benchmark_dtypes = ["int4", torch.float16]
@@ -134,8 +134,8 @@ def load_from_safetensors(checkpoint_path):
     
     if os.path.isdir(checkpoint_path):
         # Check for index file (sharded model)
-        index_path = os.path.join(checkpoint_path, "quantized_model.safetensors.index.json")
-        single_path = os.path.join(checkpoint_path, "quantized_model.safetensors")
+        index_path = os.path.join(checkpoint_path, "model.safetensors.index.json")
+        single_path = os.path.join(checkpoint_path, "model.safetensors")
         
         if os.path.exists(index_path):
             # Sharded model - load index

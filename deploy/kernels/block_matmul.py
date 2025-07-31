@@ -228,7 +228,7 @@ def quant_kernel(
 
 
 FUSION=True
-def block_matmul(b, c, seq_len, clip_factor_a_max, clip_factor_a_min):
+def block_matmul(b, c, seq_len, clip_factor_a_max, clip_factor_a_min, just_quantize = False):
     # Check constraints.
     # b @ c, b [b, m, n], c [n, n]
     assert b.shape[2] == c.shape[0], "Incompatible dimensions"
@@ -241,23 +241,12 @@ def block_matmul(b, c, seq_len, clip_factor_a_max, clip_factor_a_min):
     output_scale = torch.empty((B, 1), device=b.device, dtype=torch.float16)
     quant_res = torch.empty((B, M, N // 2), device=b.device, dtype=torch.uint8)
 
+    # TODO: handle shared memory issue. In this setting, A100 can't get full speedup.
+    np2_M = min(triton.next_power_of_2(M), 128)
+    np2_N = min(triton.next_power_of_2(N), 32)
+
     # 1D launch kernel where each block gets its own program.
-    if FUSION:
-        grid = (1, seq_len, Actual_B)
-        matmul_quant_kernel[grid](
-            b, c,  #
-            quant_res, #
-            output_scale, #
-            B, M, N,  #
-            triton.next_power_of_2(M),
-            triton.next_power_of_2(N),
-            b.stride(0), b.stride(1), b.stride(2),  #
-            c.stride(0), c.stride(1), #
-            quant_res.stride(0), quant_res.stride(1), quant_res.stride(2),  #
-            clip_factor_a_max,
-            clip_factor_a_min,
-        )
-    else:
+    if just_quantize:
         bmm_res = torch.empty((B, M, N), device=b.device, dtype=b.dtype)
         grid = (1, seq_len, Actual_B)
         matmul_kernel[grid](
@@ -265,27 +254,58 @@ def block_matmul(b, c, seq_len, clip_factor_a_max, clip_factor_a_min):
             bmm_res, #
             output_scale, #
             B, M, N,  #
-            triton.next_power_of_2(M),
-            triton.next_power_of_2(N),
+            np2_M,
+            np2_N,
             b.stride(0), b.stride(1), b.stride(2),  #
             c.stride(0), c.stride(1), #
             bmm_res.stride(0), bmm_res.stride(1), bmm_res.stride(2),  #
         )
-        grid = (seq_len, Actual_B)
-        quant_kernel[grid](
-            bmm_res,
-            bmm_res.stride(0), bmm_res.stride(1), bmm_res.stride(2), 
-            quant_res,
-            quant_res.stride(0), quant_res.stride(1), quant_res.stride(2),
-            output_scale,
-            B, M, N,
-            triton.next_power_of_2(M),
-            triton.next_power_of_2(N),
-            clip_factor_a_max,
-            clip_factor_a_min,
-        )
-    packed_tensor = deploy.PackedQuantizedTensor(quant_res.reshape(B, -1), output_scale)
-    return packed_tensor
+        return bmm_res.view(B, -1)
+    else:
+        if FUSION:
+            grid = (1, seq_len, Actual_B)
+            matmul_quant_kernel[grid](
+                b, c,  #
+                quant_res, #
+                output_scale, #
+                B, M, N,  #
+                np2_M,
+                np2_N,
+                b.stride(0), b.stride(1), b.stride(2),  #
+                c.stride(0), c.stride(1), #
+                quant_res.stride(0), quant_res.stride(1), quant_res.stride(2),  #
+                clip_factor_a_max,
+                clip_factor_a_min,
+            )
+        else:
+            bmm_res = torch.empty((B, M, N), device=b.device, dtype=b.dtype)
+            grid = (1, seq_len, Actual_B)
+            matmul_kernel[grid](
+                b, c,  #
+                bmm_res, #
+                output_scale, #
+                B, M, N,  #
+                np2_M,
+                np2_N,
+                b.stride(0), b.stride(1), b.stride(2),  #
+                c.stride(0), c.stride(1), #
+                bmm_res.stride(0), bmm_res.stride(1), bmm_res.stride(2),  #
+            )
+            grid = (seq_len, Actual_B)
+            quant_kernel[grid](
+                bmm_res,
+                bmm_res.stride(0), bmm_res.stride(1), bmm_res.stride(2), 
+                quant_res,
+                quant_res.stride(0), quant_res.stride(1), quant_res.stride(2),
+                output_scale,
+                B, M, N,
+                triton.next_power_of_2(M),
+                triton.next_power_of_2(N),
+                clip_factor_a_max,
+                clip_factor_a_min,
+            )
+        packed_tensor = deploy.PackedQuantizedTensor(quant_res.reshape(B, -1), output_scale)
+        return packed_tensor
 
 
 def benchmark(B, M, N, S, provider):
