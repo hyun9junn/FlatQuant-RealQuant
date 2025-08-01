@@ -345,6 +345,7 @@ class FlatQuantLlamaForCausalLM(FlatQuantFP16LlamaForCausalLM):
         from safetensors.torch import load_file
         from safetensors import safe_open
         import json
+        from transformers.modeling_utils import no_init_weights
 
         dtype_old = torch.get_default_dtype()
         torch.set_default_dtype(torch.float16)
@@ -362,7 +363,8 @@ class FlatQuantLlamaForCausalLM(FlatQuantFP16LlamaForCausalLM):
         args.online_trans = quant_config.get('online_trans', ["qk", "o_proj", "down_proj", "qkv_proj", "up_gate_proj"])
         args.online_trans = set(args.online_trans)
 
-        model = cls(args, config)
+        with no_init_weights():
+            model = cls(args, config)
 
         state_dict = {}
 

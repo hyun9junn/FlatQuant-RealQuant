@@ -17,11 +17,11 @@ supported_models = [
             './modelzoo/llama-3/llama-3-70b',
             './modelzoo/llama-3.1/llama-3.1-8b',
             './modelzoo/llama-3.1/llama-3.1-70b',
-            './modelzoo/llama-3.1-instruct/llama-3.1-instruct-8b',
-            './modelzoo/llama-3-instruct/llama-3-instruct-8b',
+            './modelzoo/llama-3.1-instruct/llama-3.1-8b-instruct',
             './modelzoo/llama-3-instruct/llama-3-8b-instruct',
-            './modelzoo/qwen-2.5-instruct/qwen-2.5-instruct-7b',
-            './modelzoo/qwen-2.5-instruct/qwen-2.5-instruct-32b',
+            './modelzoo/llama-3-instruct/llama-3-8b-instruct',
+            './modelzoo/qwen-2.5-instruct/qwen-2.5-7b-instruct',
+            './modelzoo/qwen-2.5-instruct/qwen-2.5-32b-instruct',
             ]
 # supported_models = [
 #             'meta-llama/Llama-2-7b-hf',
