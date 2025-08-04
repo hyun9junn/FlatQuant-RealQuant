@@ -95,12 +95,11 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
         kv_seq_len = key_states.shape[1]
         kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-        # Llama 3.1 호환성을 위한 수정
         if position_embeddings is None:
-            # 기존 방식: rotary_emb를 직접 호출
+            # for llama2, 3
             cos, sin = self.rotary_emb(value_states, position_ids)
         else:
-            # 새로운 방식: 외부에서 계산된 position_embeddings 사용
+            # for llama 3.1~
             cos, sin = position_embeddings
             
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids, unsqueeze_dim=2)
