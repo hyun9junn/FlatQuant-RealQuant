@@ -1,10 +1,17 @@
-# A fork of FlatQuant codebase
+# Real FlatQuant codebase
 
-# Changelog
+## Changelog
 - Updated cutlass library version since the original version had the bug (see [here](https://github.com/ruikangliu/FlatQuant/issues/16)).
-- Updated the requirements.txt to use later version of `torch`.
+- Updated the requirements.txt to use later version of `torch` & transformer==4.45.0 for llama>3.1.
+- Add `--quantized_save` flag to save quantized weight in FP16 format.
+- Add `benchmark_model.py` to measure **real speedup** for **whole model** with **real quantized weights**.
+- Add `benchmark_lm_eval.py` to measure **zero-shot performance** for **real quantized model**.
+- Upload real quantized model in Huggingface.
+- Now this codebase can support llama2, llama3, llama3.1, llama3.2, llama3.3.
+- ⚠️ Currently, only models with a `hidden_dim` that is a power of 2 are supported because of triton kernel implementation.
 
-# Installation
+
+## Installation
 1. Install the packages
     ```bash
     conda create -n flatquant python=3.10 -y
@@ -18,6 +25,112 @@
     ```bash
     python get_snapshot_dir.py
     ```
+
+- Unlike original FlatQuant paper, we use `./modelzoo/{model_type}/{hf_model_name}` format e.g. `./modelzoo/llama-3-instruct/llama-3-8b-instruct`.
+- ⚠️ Be sure to use the correct **_CUDA.so** file that matches your environment and GPU. Using a .so file compiled in a different environment may lead to different kernel outputs. You can compile this file with `pip install -e .` in your environment.
+
+
+## Usage
+
+### Calibration
+
+1. Weight-Activation-KV Cache Quantization
+
+```bash
+# W4A4KV4
+python ./main.py \
+    --model ./modelzoo/llama-3/llama-3-8b \
+    --w_bits 4 --a_bits 4 \
+    --k_bits 4 --k_asym --k_groupsize 128 \
+    --v_bits 4 --v_asym --v_groupsize 128 \
+    --cali_bsz 4 --epoch 15 --flat_lr 5e-3 \
+    --lwc --lac --cali_trans --add_diag \
+    --output_dir ./outputs --save_matrix \
+    --lm_eval --lm_eval_batch_size 16 \
+    --quantized_save
+```
+
+### Evaluation & Check Speedup
+
+```bash
+python ./benchmarks/benchmark_model.py --batch_size 1
+python ./benchmarks/benchmark_lm_eval.py --lm_eval_batch_size 16
+```
+
+- If you want to check original speedup in the FlatQuant paper, use `--random_mode`. It is better to use transformer==4.36 with `git checkout 6442984` for results with high similarity to the original paper.
+- ⚠️ Currently, only quantized models with WAKV sym_quantize are supported.
+
+### Only use pre-quantized model
+
+Use models in Huggingface.
+
+| Model                  |  URL                                                                                                                                                          |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| LLaMA-2-7B             |  [https://huggingface.co/Hyun9junn/Llama-2-7b-hf-W4A4KV4-FlatQuant](https://huggingface.co/Hyun9junn/Llama-2-7b-hf-W4A4KV4-FlatQuant)                         |
+| LLaMA-3-8B             |  [https://huggingface.co/Hyun9junn/Meta-Llama-3-8B-W4A4KV4-FlatQuant](https://huggingface.co/Hyun9junn/Meta-Llama-3-8B-W4A4KV4-FlatQuant)                     |
+| LLaMA-3-8B-Instruct    |  [https://huggingface.co/Hyun9junn/Meta-Llama-3-8B-Instruct-W4A4KV4-FlatQuant](https://huggingface.co/Hyun9junn/Meta-Llama-3-8B-Instruct-W4A4KV4-FlatQuant)   |
+| LLaMA-3-70B            |  [https://huggingface.co/Hyun9junn/Meta-Llama-3-70B-W4A4KV4-FlatQuant](https://huggingface.co/Hyun9junn/Meta-Llama-3-70B-W4A4KV4-FlatQuant)                   |
+| LLaMA-3.1-8B           |  [https://huggingface.co/Hyun9junn/Llama-3.1-8B-W4A4KV4-FlatQuant](https://huggingface.co/Hyun9junn/Llama-3.1-8B-W4A4KV4-FlatQuant)                           |
+| LLaMA-3.1-8B-Instruct  |  [https://huggingface.co/Hyun9junn/Llama-3.1-8B-Instruct-W4A4KV4-FlatQuant](https://huggingface.co/Hyun9junn/Llama-3.1-8B-Instruct-W4A4KV4-FlatQuant)         |
+| LLaMA-3.3-70B-Instruct |  [https://huggingface.co/Hyun9junn/Llama-3.3-70B-Instruct-W4A4KV4-FlatQuant](https://huggingface.co/Hyun9junn/Llama-3.3-70B-Instruct-W4A4KV4-FlatQuant)       |
+
+
+## Results
+
+### Accuracy Results
+
+**Table 1: WikiText-2 perplexity of 4-bit weight & acitvation quantized LLaMA models.**
+
+| **Method**        | **W Quantizer** | **2-7B** | **2-13B** | **2-70B** | **3-8B** | **3-70B** | **3.1-8B** | **3-8B-Instuct** | **3.1-8B-Instuct** | **3.3-70B-Instruct** |
+| -------------     | --------------- | -------- | --------- | --------- | -------- | --------- | ---------- | ---------------- | ------------------ | -------------------- |
+| FP16              | -               | 5.47     | 4.88      | 3.32      | 6.14     | 2.86      | -          | -                | -                  | -                    |
+| SmoothQuant       | RTN             | 83.12    | 35.88     | 26.01     | 210.19   | 9.60      | -          | -                | -                  | -                    |
+| OmniQuant         | RTN             | 14.74    | 12.28     | -         | -        | -         | -          | -                | -                  | -                    |
+| AffineQuant       | RTN             | 12.69    | 11.45     | -         | -        | -         | -          | -                | -                  | -                    |
+| QuaRot            | RTN             | 8.56     | 6.10      | 4.14      | 10.60    | 55.44     | -          | -                | -                  | -                    |
+| SpinQuant         | RTN             | 6.14     | 5.44      | 3.82      | 7.96     | 7.58      | -          | -                | -                  | -                    |
+| **FlatQuant**     | RTN             | **5.79** | **5.12**  | **3.55**  | **6.98** | **3.78**  | -          | -                | -                  | -                    |
+| **Real-FlatQuant**| RTN             | **5.80** | -         | -         | **6.93** | **4.83**  | **6.97**   | **9.01**         | **8.53**           | **4.03**             |
+| QUIK-4B           | GPTQ            | 8.87     | 7.78      | 6.91      | -        | -         | -          | -                | -                  | -                    |
+| QuaRot            | GPTQ            | 6.10     | 5.40      | 3.79      | 8.16     | 6.60      | -          | -                | -                  | -                    |
+| SpinQuant         | GPTQ            | 5.96     | 5.24      | 3.70      | 7.39     | 6.21      | -          | -                | -                  | -                    |
+| **FlatQuant**     | GPTQ            | **5.78** | **5.11**  | **3.54**  | **6.90** | **3.77**  | -          | -                | -                  | -                    |
+
+**Table 2: Zero-shot QA task results of 4-bit weight & activation quantized LLaMA models.**
+
+| **Method**        | **W Quantizer** | **2-7B**  | **2-13B** | **2-70B** | **3-8B**  | **3-70B** | **3.1-8B** | **3-8B-Instuct** | **3.1-8B-Instuct** | **3.3-70B-Instruct** |
+| ----------------- | --------------- | --------- | --------- | --------- | --------- | --------- | ---------- | ---------------- | ------------------ | -------------------- |
+| FP16              | -               | 69.79     | 72.55     | 77.05     | 73.23     | 79.95     | -          | -                | -                  | -                    |
+| QuaRot            | RTN             | 57.73     | 66.25     | 73.47     | 61.34     | 35.36     | -          | -                | -                  | -                    |
+| SpinQuant         | RTN             | 63.52     | 68.56     | 75.09     | 66.98     | 65.66     | -          | -                | -                  | -                    |
+| **FlatQuant**     | RTN             | **67.96** | **71.42** | **76.62** | **71.23** | **79.01** | -          | -                | -                  | -                    |
+| **Real-FlatQuant**| RTN             | **5.80**  | -         | -         | **6.93**  | **4.83**  | **6.97**   | **9.01**         | **8.53**           | **4.03**             |
+| QuaRot            | GPTQ            | 65.01     | 68.91     | 75.68     | 65.79     | 70.45     | -          | -                | -                  | -                    |
+| SpinQuant         | GPTQ            | 66.23     | 70.93     | 76.06     | 68.70     | 71.66     | -          | -                | -                  | -                    |
+| **FlatQuant**     | GPTQ            | **67.47** | **71.64** | **76.53** | **71.33** | **78.58** | -          | -                | -                  | -                    |
+
+### Latency Results
+
+**Table 3: Prefill speedup for batch sizes 1 on one RTX3090 GPU. We decode 256 tokens after the prefill on a sequence length of 2048.**
+
+| **Model name**       | **Int4** | **QuaRot** | **FlatQuant** |
+| -------------------- | -------- | ---------- | ------------- |
+| LLaMA-2-7B           | 2.10     | 1.95       | 1.98          |
+| LLaMA-3-8B           | 2.24     | 2.12       | 2.01          |
+| LLaMA-3-8B-Instruct  | 2.24     | 2.12       | 2.06          |
+
+- We only checked speedup in batch size 1 because of resoure limits.
+
+**Table 4: Decoding speedup for batch sizes 1 on one RTX3090 GPU. We decode 256 tokens after the prefill on a sequence length of 2048.**
+
+| **Model name**       | **Int4** | **QuaRot** | **FlatQuant** |
+| -------------------- | -------- | ---------- | ------------- |
+| LLaMA-2-7B           | 0.67     | 0.59       | 0.48          |
+| LLaMA-3-8B           | 0.66     | 0.58       | 0.47          |
+| LLaMA-3-8B-Instruct  | 0.67     | 0.58       | 0.48          |
+
+- We only checked speedup in batch size 1 because of resoure limits.
+
 
 ---
 # Original README.md for FlatQuant: Flatness Matters for LLM Quantization
