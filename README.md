@@ -21,6 +21,9 @@
     pip install -e .
     pip install flash-attn --no-build-isolation
     ```
+
+- To run models like LLaMA2, LLaMA3, we use `transformers==4.36.0` instead.
+
 2. Download & link the models to `./modelzoo/` via running
     ```bash
     python get_snapshot_dir.py
@@ -57,7 +60,8 @@ python ./benchmarks/benchmark_model.py --batch_size 1
 python ./benchmarks/benchmark_lm_eval.py --lm_eval_batch_size 16
 ```
 
-- If you want to check original speedup in the FlatQuant paper, use `--random_mode`. It is better to use transformer==4.36 with `git checkout 6442984` for results with high similarity to the original paper.
+- This code should be run with transformer==4.45.0
+- If you want to check original speedup in the FlatQuant paper, use `--random_mode`. It is better to use transformer==4.36.0 with `git checkout bfd9e88` for results with high similarity to the original paper.
 - ⚠️ Currently, only quantized models with WAKV sym_quantize are supported.
 
 ### Only use pre-quantized model
@@ -81,33 +85,20 @@ Use models in Huggingface.
 
 **Table 1: WikiText-2 perplexity of 4-bit weight & acitvation quantized LLaMA models.**
 
-| **Method**        | **W Quantizer** | **2-7B** | **2-13B** | **2-70B** | **3-8B** | **3-70B** | **3.1-8B** | **3-8B-Instuct** | **3.1-8B-Instuct** | **3.3-70B-Instruct** |
-| -------------     | --------------- | -------- | --------- | --------- | -------- | --------- | ---------- | ---------------- | ------------------ | -------------------- |
-| FP16              | -               | 5.47     | 4.88      | 3.32      | 6.14     | 2.86      | 6.24       | 8.28             | 7.21               | -                    |
-| SmoothQuant       | RTN             | 83.12    | 35.88     | 26.01     | 210.19   | 9.60      | -          | -                | -                  | -                    |
-| OmniQuant         | RTN             | 14.74    | 12.28     | -         | -        | -         | -          | -                | -                  | -                    |
-| AffineQuant       | RTN             | 12.69    | 11.45     | -         | -        | -         | -          | -                | -                  | -                    |
-| QuaRot            | RTN             | 8.56     | 6.10      | 4.14      | 10.60    | 55.44     | -          | -                | -                  | -                    |
-| SpinQuant         | RTN             | 6.14     | 5.44      | 3.82      | 7.96     | 7.58      | -          | -                | -                  | -                    |
-| **FlatQuant**     | RTN             | **5.79** | **5.12**  | **3.55**  | **6.98** | **3.78**  | -          | -                | -                  | -                    |
-| **Real-FlatQuant**| RTN             | **5.80** | -         | -         | **6.93** | **4.83**  | **6.97**   | **9.01**         | **8.53**           | **4.03**             |
-| QUIK-4B           | GPTQ            | 8.87     | 7.78      | 6.91      | -        | -         | -          | -                | -                  | -                    |
-| QuaRot            | GPTQ            | 6.10     | 5.40      | 3.79      | 8.16     | 6.60      | -          | -                | -                  | -                    |
-| SpinQuant         | GPTQ            | 5.96     | 5.24      | 3.70      | 7.39     | 6.21      | -          | -                | -                  | -                    |
-| **FlatQuant**     | GPTQ            | **5.78** | **5.11**  | **3.54**  | **6.90** | **3.77**  | -          | -                | -                  | -                    |
+| **Method**         | **W Quantizer** | **2-7B** | **3-8B**   | **3-70B** | **3.1-8B** | **3-8B-Instuct** | **3.1-8B-Instuct** | **3.3-70B-Instruct** |
+| ------------------ | --------------- | -------- | ---------- | --------- | ---------- | ---------------- | ------------------ | -------------------- |
+| FP16               | -               | 5.47     | 6.14       | -         | 6.24       | 8.28             | 7.21               | -                    |
+| **Fake-FlatQuant** | RTN             | **5.79** | **6.98**   | -         | **7.01**   | **8.97**         | **7.97**           | -                    |
+| **Real-FlatQuant** | RTN             | **5.80** | **6.93**   | **4.83**  | **6.97**   | **9.01**         | **8.53**           | **4.03**             |
 
 **Table 2: Zero-shot QA task results of 4-bit weight & activation quantized LLaMA models.**
 
-| **Method**        | **W Quantizer** | **2-7B**  | **2-13B** | **2-70B** | **3-8B**  | **3-70B** | **3.1-8B** | **3-8B-Instuct** | **3.1-8B-Instuct** | **3.3-70B-Instruct** |
-| ----------------- | --------------- | --------- | --------- | --------- | --------- | --------- | ---------- | ---------------- | ------------------ | -------------------- |
-| FP16              | -               | 69.79     | 72.55     | 77.05     | 73.23     | 79.95     | -          | -                | -                  | -                    |
-| QuaRot            | RTN             | 57.73     | 66.25     | 73.47     | 61.34     | 35.36     | -          | -                | -                  | -                    |
-| SpinQuant         | RTN             | 63.52     | 68.56     | 75.09     | 66.98     | 65.66     | -          | -                | -                  | -                    |
-| **FlatQuant**     | RTN             | **67.96** | **71.42** | **76.62** | **71.23** | **79.01** | -          | -                | -                  | -                    |
-| **Real-FlatQuant**| RTN             | **5.80**  | -         | -         | **6.93**  | **4.83**  | **6.97**   | **9.01**         | **8.53**           | **4.03**             |
-| QuaRot            | GPTQ            | 65.01     | 68.91     | 75.68     | 65.79     | 70.45     | -          | -                | -                  | -                    |
-| SpinQuant         | GPTQ            | 66.23     | 70.93     | 76.06     | 68.70     | 71.66     | -          | -                | -                  | -                    |
-| **FlatQuant**     | GPTQ            | **67.47** | **71.64** | **76.53** | **71.33** | **78.58** | -          | -                | -                  | -                    |
+| **Method**         | **W Quantizer** | **2-7B**  | **3-8B**  | **3-70B** | **3.1-8B** | **3-8B-Instuct** | **3.1-8B-Instuct** | **3.3-70B-Instruct** |
+| ------------------ | --------------- | --------- | --------- | --------- | ---------- | ---------------- | ------------------ | -------------------- |
+| FP16               | -               | 69.81     | 73.26     | -         | 74.04      | 72.54            | 73.76              | -                    |
+| **Fake-FlatQuant** | RTN             | **67.98** | **70.58** | -         | **71.52**  | **70.50**        | **71.36**          | -                    |
+| **Real-FlatQuant** | RTN             | **67.88** | **70.46** | **77.52** | **71.35**  | **70.57**        | **70.95**          | **77.62**            |
+
 
 ### Latency Results
 
