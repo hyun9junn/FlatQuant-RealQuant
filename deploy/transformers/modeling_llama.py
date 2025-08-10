@@ -57,6 +57,15 @@ class FlatQuantFP16LlamaAttention(LlamaFlashAttention2):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         output_attentions = False
 
+        device = hidden_states.device
+        if position_ids is not None and position_ids.device != device:
+            position_ids = position_ids.to(device)
+        if attention_mask is not None and attention_mask.device != device:
+            attention_mask = attention_mask.to(device)
+        if cache_position is not None and cache_position.device != device:
+            cache_position = cache_position.to(device)
+
+
         bsz, q_len, _ = hidden_states.size()
         
         self.isFlatQ = False
@@ -295,8 +304,9 @@ class FlatQuantFP16LlamaForCausalLM(LlamaForCausalLM):
             self.trans = "none"
             self.online_trans = set()
         
-    def build_cache(self, batch_size, page_size, max_length):
-        device = self.model.layers[0].self_attn.v_proj.weight.device
+    def build_cache(self, batch_size, page_size, max_length, device = None):
+        if device is None:
+            device = self.model.layers[0].self_attn.v_proj.weight.device
         dtype = self.cache_dtype or self.model.layers[0].self_attn.v_proj.weight.dtype
         
         num_heads = self.config.num_attention_heads
@@ -326,10 +336,25 @@ class FlatQuantFP16LlamaForCausalLM(LlamaForCausalLM):
         return super()._get_logits_processor(generation_config, *args, **kwargs)
 
 
+    def _ensure_rotary_emb_on_device(self):
+        """rotary_emb를 첫 번째 레이어와 같은 디바이스로 이동"""
+        if hasattr(self.model, 'rotary_emb') and self.model.rotary_emb is not None:
+            target_device = self.model.layers[0].self_attn.q_proj.weight.device
+            if next(self.model.rotary_emb.parameters(), None) is not None:
+                param_device = next(self.model.rotary_emb.parameters()).device
+                if param_device != target_device:
+                    self.model.rotary_emb = self.model.rotary_emb.to(target_device)
+            
+            # 버퍼들도 이동
+            for name, buffer in self.model.rotary_emb.named_buffers():
+                if buffer is not None and buffer.device != target_device:
+                    self.model.rotary_emb.register_buffer(name, buffer.to(target_device), persistent=False)
+
     def forward(self, input_ids, *args, past_key_values=None, **kwargs):
         if past_key_values is None or isinstance(past_key_values, DynamicCache):
             max_length = max(self._expected_max_length or 0, input_ids.shape[1])
             self._expected_max_length = None # Reset this value.
+            cache_device = self.model.layers[0].self_attn.q_proj.weight.device
             past_key_values = self.build_cache(
                 input_ids.shape[0], 
                 page_size=min(2048, max_length),  # For now working with single page per batch.
@@ -513,8 +538,59 @@ class FlatQuantLlamaForCausalLM(FlatQuantFP16LlamaForCausalLM):
                     .replace("self_attn.o_proj.weight_scales", "self_attn.o_proj.1.weight_scales")
             new_checkpoint["quantizers"][new_k] = v.scale
 
-        model.load_state_dict(new_checkpoint["model_state_dict"], strict = False)
+        device_map = kwargs.pop('device_map', None)
+        max_memory = kwargs.pop('max_memory', None)
+        offload_folder = kwargs.pop('offload_folder', None)
+        offload_state_dict = kwargs.pop('offload_state_dict', False)
+        
+        from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+        if device_map:
+            model = load_checkpoint_and_dispatch(
+                model,
+                checkpoint=new_checkpoint["model_state_dict"],
+                device_map=device_map,
+                dtype=torch.float16,
+                offload_folder=offload_folder,
+                offload_state_dict=offload_state_dict,
+                max_memory=max_memory
+            )
         model.load_state_dict(new_checkpoint["quantizers"], strict = False)
+
+        hf_device_map = model.hf_device_map
+
+        for mod_name, module in model.named_modules():
+            look_up = mod_name
+            while True:
+                if look_up in hf_device_map:
+                    target = hf_device_map[look_up]
+                    break
+                if "." not in look_up:
+                    target = None
+                    break
+                look_up = look_up.rsplit(".", 1)[0]
+
+            device = torch.device(target) if isinstance(target, str) else target
+            for buf_name, buf in list(module._buffers.items()):
+                if buf is not None and buf.device != device:
+                    module._buffers[buf_name] = buf.to(device)
+                    
+
+        for layer_idx, layer in enumerate(model.model.layers):
+            if hasattr(layer.self_attn, 'rotary_emb'):
+                # 해당 레이어의 디바이스 확인
+                layer_device = layer.self_attn.q_proj.weight.device
+                
+                # rotary_emb를 같은 디바이스로 이동
+                layer.self_attn.rotary_emb = layer.self_attn.rotary_emb.to(layer_device)
+                
+                # 버퍼들도 확실히 이동
+                for buffer_name, buffer in layer.self_attn.rotary_emb.named_buffers():
+                    if buffer is not None and buffer.device != layer_device:
+                        layer.self_attn.rotary_emb.register_buffer(
+                            buffer_name, 
+                            buffer.to(layer_device),
+                            persistent=False
+                        )
 
         for layer in model.model.layers:    
             layer.self_attn.inp_trans_q.register_buffer("left_matrix", layer.self_attn.left_matrix)

@@ -26,16 +26,26 @@ class FlatQuantizedLinear(nn.Module):
         self._eval_mode = False
 
     def apply_wclip(self, weight):
+        dev = weight.device
         wmin, wmax = weight.min(1, keepdim=True)[0], weight.max(1, keepdim=True)[0]
-        wmax *= self.sigmoid(self.clip_factor_w_max)
-        wmin *= self.sigmoid(self.clip_factor_w_min)
+
+        cf_wmax = self.clip_factor_w_max
+        cf_wmin = self.clip_factor_w_min
+        if isinstance(cf_wmax, torch.Tensor) and cf_wmax.device != dev:
+            cf_wmax = cf_wmax.to(dev, non_blocking=True)
+            cf_wmin = cf_wmin.to(dev, non_blocking=True)
+
+        wmax *= self.sigmoid(cf_wmax)
+        wmin *= self.sigmoid(cf_wmin)
         weight = torch.clamp(weight, min=wmin, max=wmax)
         return weight
 
     def apply_trans(self, weight, qa_trans):
+        dev = weight.device
         if isinstance(qa_trans, list):
             weight = kronecker_matmul(weight, qa_trans[0].to(weight), qa_trans[1].to(weight))
         else:
+            qa_trans = qa_trans.to(dev)
             weight = qa_trans(weight, inv_t=True)
         return weight
 
@@ -56,6 +66,8 @@ class FlatQuantizedLinear(nn.Module):
         # quantize weight
         self.weight_quantizer.find_params(weight)
         weight = self.weight_quantizer(weight)
+        if isinstance(self.act_quantizer, torch.nn.Module):
+            self.act_quantizer = self.act_quantizer.to(hidden_states.device, non_blocking=True)
         # quantize activation
         hidden_states = self.act_quantizer(hidden_states)
 
@@ -74,7 +86,15 @@ class FlatQuantizedLinear(nn.Module):
 
     def _eval_forward(self, hidden_states):
         x_dtype = hidden_states.dtype
+        dev = hidden_states.device
+        if isinstance(self.act_quantizer, torch.nn.Module):
+            self.act_quantizer = self.act_quantizer.to(hidden_states.device, non_blocking=True)
         hidden_states = self.act_quantizer(hidden_states).to(x_dtype)
+
+        if self.linear.weight.device != dev:
+            self.linear.weight.data = self.linear.weight.data.to(dev, non_blocking=True)
+        if self.linear.bias is not None and self.linear.bias.device != dev:
+            self.linear.bias.data = self.linear.bias.data.to(dev, non_blocking=True)
 
         output = self.linear(hidden_states)
         return output

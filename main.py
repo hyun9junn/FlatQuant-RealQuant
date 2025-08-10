@@ -51,13 +51,26 @@ def main():
     if args.quantized_save:
         flat_utils.save_quantized_weights_with_safetensors(args, model, quantizers)
 
-    if args.distribute_model:
+    """if args.distribute_model:
         utils.distribute_model(model)
     else:
-        model.to(utils.DEV)
-    
+        model.to(utils.DEV)"""
+    import torch
+    with torch.no_grad():
+        for i, layer in enumerate(model.model.layers):
+            # 레이어 할당 디바이스
+            if getattr(model, "hf_device_map", None) and f"model.layers.{i}" in model.hf_device_map:
+                dev = torch.device(model.hf_device_map[f"model.layers.{i}"])
+            else:
+                dev = next(layer.parameters()).device  # fallback
+            layer.input_layernorm.weight.data = layer.input_layernorm.weight.data.to(dev, non_blocking=True)
+            layer.post_attention_layernorm.weight.data = layer.post_attention_layernorm.weight.data.to(dev, non_blocking=True)
+
+    for i in (0, 1, 19, 20, 39):
+        ln = model.model.layers[i].input_layernorm
+        print(i, ln.weight.device)
     # Evaluating PPL
-    for eval_dataset in ["wikitext2", "c4"]:
+    for eval_dataset in ["wikitext2"]:
         logger.info(eval_dataset)
         testloader = data_utils.get_loaders(
                 args,
@@ -77,8 +90,9 @@ def main():
         from lm_eval import utils as lm_eval_utils
         from lm_eval.models.huggingface import HFLM
 
-        hflm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=args.lm_eval_batch_size)
-
+        hflm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=args.lm_eval_batch_size, device=None)
+        embed_device = model.model.embed_tokens.weight.device
+        hflm._model_device = embed_device
         # task_manager = lm_eval.tasks.TaskManager(include_path="./datasets/lm_eval_configs/tasks", include_defaults=False)
         # task_names = lm_eval_utils.pattern_match(args.tasks, task_manager.all_tasks)
         task_names = args.tasks

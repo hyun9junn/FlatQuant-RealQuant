@@ -77,49 +77,66 @@ def load_dataset(config_name):
 def ppl_eval(model, testenc):
     print('Evaluating ppl...')
     model.eval()
-    model = model.cuda()
-    max_length = 2048   # fix model max length
+    max_length = 2048
 
     testenc = testenc.input_ids
     nsamples = testenc.numel() // max_length
 
-    dev = next(model.parameters()).device
-
+    dev = model.model.embed_tokens.weight.device
     testenc = testenc.to(dev)
 
     # warmup
-    for i in range(num_warmup_steps):
+    for i in range(min(num_warmup_steps, nsamples)):
         batch = testenc[:, (i * max_length): ((i + 1) * max_length)]
-        out = model(batch)
+        with torch.cuda.amp.autocast():  # Mixed precision
+            out = model(batch)
+        del out
+        torch.cuda.empty_cache()
+    
     torch.cuda.synchronize()
     _cleanup()
 
     nlls = []
     inference_times = []
     
-    for i in range(nsamples):
+    for i in tqdm(range(nsamples)):
         batch = testenc[:, (i * max_length): ((i + 1) * max_length)]
 
         torch.cuda.synchronize()
         start_time = time.perf_counter()
 
-        lm_logits = model(batch).logits
+        # logits를 바로 처리하고 메모리 해제
+        with torch.cuda.amp.autocast():
+            outputs = model(batch)
+            lm_logits = outputs.logits
+            
+            # logits가 여러 GPU에 분산되어 있을 수 있으므로
+            # 필요한 부분만 가져와서 처리
+            shift_logits = lm_logits[:, :-1, :].contiguous()
+            shift_labels = batch[:, 1:].to(shift_logits.device)
+            
+            # 즉시 loss 계산
+            loss_fct = torch.nn.CrossEntropyLoss()
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), 
+                          shift_labels.view(-1))
+            neg_log_likelihood = loss.float() * max_length
+            nlls.append(neg_log_likelihood.cpu())  # CPU로 이동
+            
+            # 메모리 해제
+            del outputs, lm_logits, shift_logits, shift_labels
+            torch.cuda.empty_cache()
 
         torch.cuda.synchronize()
         end_time = time.perf_counter()
-
         inference_times.append((end_time - start_time) * 1000)
-
-        shift_logits = lm_logits[:, :-1, :].contiguous()
-        shift_labels = testenc[
-            :, (i * max_length): ((i + 1) * max_length)
-        ][:, 1:].to(shift_logits.device)
-
-        loss_fct = torch.nn.CrossEntropyLoss()
-        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        neg_log_likelihood = loss.float() * max_length
-        nlls.append(neg_log_likelihood)
-    ppl = torch.exp(torch.stack(nlls).sum() / (len(nlls) * max_length))
+        
+        # 주기적으로 메모리 정리
+        if i % 10 == 0:
+            _cleanup()
+    
+    # CPU에서 계산
+    nlls_tensor = torch.stack(nlls)
+    ppl = torch.exp(nlls_tensor.sum() / (len(nlls) * max_length))
     avg_time = np.mean(inference_times)
     std_time = np.std(inference_times)
 
@@ -279,10 +296,35 @@ def get_model_hf(config_name):
     )
 
 def get_model_fp16(config_name):
-    return modeling_llama.FlatQuantFP16LlamaForCausalLM.from_pretrained(
+    config = transformers.AutoConfig.from_pretrained(
         config_name, 
         torch_dtype=torch.float16, 
         attn_implementation="flash_attention_2"
+    )
+
+    num_layers = config.num_hidden_layers
+    layers_per_gpu = num_layers // 2
+    
+    device_map = {
+        "model.embed_tokens": 0,
+        "model.norm": 1,
+        "lm_head": 1,
+    }
+
+    for i in range(num_layers):
+        if i < layers_per_gpu:
+            device_map[f"model.layers.{i}"] = 0
+        else:
+            device_map[f"model.layers.{i}"] = 1
+
+    return modeling_llama.FlatQuantFP16LlamaForCausalLM.from_pretrained(
+        config_name, 
+        torch_dtype=torch.float16, 
+        attn_implementation="flash_attention_2",
+        device_map=device_map,
+        offload_folder="offload",
+        offload_state_dict=True,
+        max_memory={0: "50GB", 1: "50GB"},
     )
 
 
@@ -326,7 +368,7 @@ def _wait_for_input():
 @torch.no_grad
 def run_all_for_model(model, bsz, prefill, decode):
     model.eval()
-    model = model.cuda()
+    #model = model.cuda()
     time_prefill, _ = run_prefill(model, bsz, prefill)
     _cleanup()
     if decode is not None:
@@ -376,7 +418,7 @@ def benchmark(args):
         args.fuseLN, args.trans = False, "none"
         args.online_trans = set()
         model = get_model_fp16(config_name)
-        model.to('cuda')
+        #model.to('cuda')
 
         if args.random_mode:
             time_prefill_f16, time_decode_f16, time_e2e_f16, mem_f16 = run_all_for_model(
@@ -396,7 +438,7 @@ def benchmark(args):
         print(f"test-inference time: {time_f16:.3f} +- {1.96 * std_f16:.3f}ms per sequence")
         print(f"Perplexity: {ppl_f16:.3f}")
 
-        # Int4
+        """# Int4
         print(f'------------------------- Int4 ------------------------')
         args.fuseLN, args.trans = False, "none"
         args.online_trans = set()
@@ -447,9 +489,9 @@ def benchmark(args):
         print(f"test-inference time: {time_i4:.3f} +- {1.96 * std_i4:.3f}ms per sequence")
         print(f"Speedup: {speedup_i4:.3f}x Speedup loss: {(speedup_i4_benchmark - speedup_i4):.3f}")
         print(f"Perplexity: {ppl_i4:.3f}")
-        print(f"Perplexity degradation: {ppl_i4 / ppl_f16:.3f}")
+        print(f"Perplexity degradation: {ppl_i4 / ppl_f16:.3f}")"""
             
-        # FlatQuant
+        """# FlatQuant
         args.fuseLN, args.trans = False, "matmul"
         online_trans_list = [
             {"qk", "o_proj", "down_proj", "qkv_proj", "up_gate_proj"}
@@ -478,9 +520,9 @@ def benchmark(args):
             
             speedup_i4 = time_f16 / time_i4
             print(f"test-inference time: {time_i4:.3f} +- {1.96 * std_i4:.3f}ms per sequence")
-            print(f"Speedup: {speedup_i4:.3f}x Speedup loss: {(speedup_i4_benchmark - speedup_i4):.3f}")
+            #print(f"Speedup: {speedup_i4:.3f}x Speedup loss: {(speedup_i4_benchmark - speedup_i4):.3f}")
             print(f"Perplexity: {ppl_i4:.3f}")
-            print(f"Perplexity degradation: {ppl_i4 / ppl_f16:.3f}")
+            print(f"Perplexity degradation: {ppl_i4 / ppl_f16:.3f}")"""
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

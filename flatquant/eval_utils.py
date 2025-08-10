@@ -10,7 +10,7 @@ def ppl_eval(model, testenc):
     testenc = testenc.input_ids
     nsamples = testenc.numel() // max_length
 
-    dev = next(model.parameters()).device
+    dev = model.model.embed_tokens.weight.device
 
     testenc = testenc.to(dev)
     nlls = []

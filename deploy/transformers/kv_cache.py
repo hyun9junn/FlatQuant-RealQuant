@@ -173,6 +173,9 @@ class MultiLayerPagedKVCache4Bit(Cache):
         device, n_layers, num_heads, head_dim, 
         disable_quant=False, trans_dtype=torch.float16,
         trans="had", group_size = 1):
+        super().__init__()
+        self._is_cache = True
+
         self.page_size = page_size
         self.batch_size = batch_size
         max_page_cnt = self.page_cnt_from_length(max_seq_len)
@@ -199,6 +202,10 @@ class MultiLayerPagedKVCache4Bit(Cache):
         self.trans_dtype = trans_dtype
         self.n_layers = n_layers
         self.group_size = group_size
+
+    def to(self, device):
+        """Cache는 이미 올바른 디바이스에 있으므로 그대로 반환"""
+        return self
 
     def page_cnt_from_length(self, length):
         return (length + self.page_size - 1) // self.page_size

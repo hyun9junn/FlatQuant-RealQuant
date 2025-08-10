@@ -26,8 +26,8 @@ class FlatQuantLlamaMLP(LlamaMLP):
         self._ori_mode = False
         self.diag_init = args.diag_init
         if self.diag_init == "sq_style":
-            self.up_smax = torch.ones_like(self.up_proj.linear.weight.abs().max(dim=0)[0]).cuda() * 1e-5
-            self.down_smax = torch.ones_like(self.down_proj.linear.weight.abs().max(dim=0)[0]).cuda() * 1e-5
+            self.up_smax = torch.ones_like(self.up_proj.linear.weight.abs().max(dim=0)[0]) * 1e-5
+            self.down_smax = torch.ones_like(self.down_proj.linear.weight.abs().max(dim=0)[0]) * 1e-5
         
     def add_fq_trans(self):
         if self.args.direct_inv:
@@ -85,9 +85,10 @@ class FlatQuantLlamaMLP(LlamaMLP):
         # merge trans's diag scale
         if self.down_trans is not None and self.down_trans.add_diag:
             up_weight = self.up_proj.linear.weight
+            dev = up_weight.device
             ori_dtype = up_weight.dtype
             up_weight = up_weight.to(torch.float64).T.mul(self.down_trans.diag_scale.to(torch.float64)).T
-            self.up_proj.linear.weight.data = up_weight.to(ori_dtype)
+            self.up_proj.linear.weight.data = up_weight.to(device=dev, dtype=ori_dtype)
             self.down_trans.use_diag = False
 
     def init_diag_scale(self, alpha=0.5):
@@ -132,7 +133,7 @@ class FlatQuantLlamaAttention(LlamaAttention):
         self._eval_mode = False
         self.diag_init = args.diag_init
         if self.diag_init == "sq_style":
-            self.ln_smax = torch.ones_like(self.q_proj.linear.weight.abs().max(dim=0)[0]).cuda() * 1e-5
+            self.ln_smax = torch.ones_like(self.q_proj.linear.weight.abs().max(dim=0)[0]) * 1e-5
 
     def add_fq_trans(self):
         if self.args.direct_inv:
@@ -177,6 +178,8 @@ class FlatQuantLlamaAttention(LlamaAttention):
         return query_states, key_states, value_states
 
     def quant_vcache(self, value_states):
+        if isinstance(self.v_cache_quantizer, torch.nn.Module):
+            self.v_cache_quantizer = self.v_cache_quantizer.to(value_states.device, non_blocking=True)
         if self.args.separate_vtrans:
             value_states = self.vcache_trans(value_states)
         if self.args.v_bits < 16:
@@ -184,6 +187,10 @@ class FlatQuantLlamaAttention(LlamaAttention):
         return value_states
 
     def quant_kcache(self, q, k):
+        if hasattr(self, "q_cache_quantizer") and isinstance(self.q_cache_quantizer, torch.nn.Module):
+            self.q_cache_quantizer = self.q_cache_quantizer.to(q.device, non_blocking=True)
+        if isinstance(self.k_cache_quantizer, torch.nn.Module):
+            self.k_cache_quantizer = self.k_cache_quantizer.to(k.device, non_blocking=True)
         if not (self.args.k_bits < 16 or self.args.q_bits < 16):
             return q, k
         # Q/K transform

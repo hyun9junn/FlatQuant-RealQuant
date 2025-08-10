@@ -83,6 +83,18 @@ class ActivationQuantizer(torch.nn.Module):
             return asym_quant_dequant(x, scale, zero, self.q_max.to(x)).to(x_dtype)  # TODO
 
     def get_scale_zero(self, x):
+        dev = x.device
+        # ✅ 클립 팩터를 입력 디바이스로
+        if hasattr(self, "clip_factor_a_max") and isinstance(self.clip_factor_a_max, torch.Tensor) and self.clip_factor_a_max.device != dev:
+            self.clip_factor_a_max = self.clip_factor_a_max.to(dev, non_blocking=True)
+        if hasattr(self, "clip_factor_a_min") and isinstance(self.clip_factor_a_min, torch.Tensor) and self.clip_factor_a_min.device != dev:
+            self.clip_factor_a_min = self.clip_factor_a_min.to(dev, non_blocking=True)
+
+        # (선택) scale/zero 같은 버퍼도 있다면 동일 처리
+        if hasattr(self, "scale") and torch.is_tensor(self.scale) and self.scale.device != dev:
+            self.scale = self.scale.to(dev, non_blocking=True)
+        if hasattr(self, "zero") and torch.is_tensor(self.zero) and self.zero.device != dev:
+            self.zero = self.zero.to(dev, non_blocking=True)
         q_max = self.q_max.to(x)
         init_shape = x.shape
         reshaped_x = x.reshape((-1, x.shape[-1]))

@@ -80,16 +80,31 @@ def save_flat_matrices(args, model, rank=None):
 
 def load_flat_matrices(args, model, path=None):
     if path is None:
-        flat_parameters = torch.load(os.path.join(args.exp_dir, f"flat_matrices.pth"))
+        flat_parameters = torch.load(os.path.join(args.exp_dir, f"flat_matrices.pth"), map_location="cpu")
     else:
-        flat_parameters = torch.load(os.path.join(path, f"flat_matrices.pth"))
+        flat_parameters = torch.load(os.path.join(path, f"flat_matrices.pth"), map_location="cpu")
     layers = model.model.layers
+    n_layers_model = len(layers)
+
+    def get_layer_state(i):
+        if isinstance(flat_parameters, (list, tuple)):
+            return flat_parameters[i]
+        if i in flat_parameters:
+            return flat_parameters[i]
+        if str(i) in flat_parameters:
+            return flat_parameters[str(i)]
+        raise KeyError(f"flat_matrices에 레이어 {i}가 없음")
     
-    for i in range(len(flat_parameters.keys())):
-        flat_param = flat_parameters[i]
-        layers[i].self_attn.rep_matrix_only()
-        layers[i].mlp.rep_matrix_only()
-        layers[i].load_state_dict(flat_param, strict=False)
+    with torch.no_grad():
+        n = min(n_layers_model, len(flat_parameters))
+        for i in range(n):
+            flat_param = get_layer_state(i)
+
+            # 버퍼만 등록하는 경로: 여기서 새 텐서를 만들지 않거나 만들면 해당 모듈 디바이스로!
+            layers[i].self_attn.rep_matrix_only()
+            layers[i].mlp.rep_matrix_only()
+
+            missing, unexpected = layers[i].load_state_dict(flat_param, strict=False)
     return model
 
 
