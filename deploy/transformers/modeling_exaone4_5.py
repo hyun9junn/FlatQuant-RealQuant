@@ -8,6 +8,10 @@ from huggingface_hub import hf_hub_download
 from safetensors import safe_open
 from safetensors.torch import load_file
 from transformers.cache_utils import Cache
+try:
+    from transformers.modeling_utils import no_init_weights
+except ImportError:
+    from transformers.initialization import no_init_weights
 from transformers.models.exaone4_5.modeling_exaone4_5 import (
     ALL_ATTENTION_FUNCTIONS,
     Exaone4_5_Attention,
@@ -22,32 +26,6 @@ import deploy
 
 DEFAULT_ONLINE_TRANS = ["qk", "o_proj", "down_proj", "qkv_proj", "up_gate_proj"]
 
-
-class no_init_weights:
-    def __enter__(self):
-        self._old_fns = {}
-        for name in [
-            "uniform_",
-            "normal_",
-            "trunc_normal_",
-            "constant_",
-            "xavier_uniform_",
-            "xavier_normal_",
-            "kaiming_uniform_",
-            "kaiming_normal_",
-            "orthogonal_",
-            "zeros_",
-            "ones_",
-        ]:
-            if hasattr(torch.nn.init, name):
-                self._old_fns[name] = getattr(torch.nn.init, name)
-                setattr(torch.nn.init, name, lambda tensor, *args, **kwargs: tensor)
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        for name, fn in self._old_fns.items():
-            setattr(torch.nn.init, name, fn)
-        return False
 
 
 def _share_buffer(module, name, tensor):
