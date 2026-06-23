@@ -7,6 +7,7 @@ import logging
 
 from flatquant.utils import cleanup_memory
 from flatquant.quant_utils import WeightQuantizer
+from flatquant.model_tools.model_access import get_transformer_layer_prefix, get_transformer_layers, is_exaone45_model
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -156,9 +157,12 @@ def gptq_fwrd(model, dataloader, dev, args):
     '''
     logging.info('-----GPTQ Quantization-----')
     
+    if is_exaone45_model(model):
+        raise NotImplementedError("GPTQ is not wired for EXAONE-4.5 hybrid attention yet; use RTN first.")
+
     use_cache = model.config.use_cache
     model.config.use_cache = False
-    layers = model.model.layers
+    layers = get_transformer_layers(model)
 
     model.model.embed_tokens = model.model.embed_tokens.to(dev)
     model.model.norm = model.model.norm.to(dev)
@@ -276,7 +280,8 @@ def rtn_fwrd(model, dev, args):
     TODO: Make this function general to support both OPT and LLaMA models
     '''
     assert args.w_groupsize ==-1, "Groupsize not supported in RTN!"
-    layers = model.model.layers
+    layers = get_transformer_layers(model)
+    layer_prefix = get_transformer_layer_prefix(model)
     torch.cuda.empty_cache()
 
     quantizers = {}
@@ -301,7 +306,7 @@ def rtn_fwrd(model, dev, args):
             w_dtype = W.dtype
             quantizer.find_params(W)
             subset[name].weight.data = quantizer.quantize(W).to(w_dtype)
-            quantizers['model.layers.%d.%s' % (i, name)] = quantizer.cpu()
+            quantizers[f'{layer_prefix}.{i}.{name}'] = quantizer.cpu()
         layers[i] = layer.cpu()
         torch.cuda.empty_cache()
         del layer

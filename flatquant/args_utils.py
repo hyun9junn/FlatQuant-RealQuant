@@ -30,7 +30,7 @@ def parser_gen():
 
     # General Arguments
     parser.add_argument('--model', type=str, default='meta-llama/Llama-2-7b-hf',
-                        help='Model to load.', choices=supported_models)
+                        help='Model path or Hugging Face repo id to load.')
     parser.add_argument('--seed', type=int, default=0, help='Random seed for HuggingFace and PyTorch.')
     parser.add_argument('--hf_token', type=str, default=None, help='HuggingFace token for model access.')
 
@@ -131,6 +131,8 @@ def parser_gen():
         default=["piqa", "hellaswag", "arc_easy", "arc_challenge", "winogrande", "lambada_openai"],
         help='Tasks to evaluate on LM Eval.')
     parser.add_argument('--lm_eval_batch_size', type=int, default=128, help='Batch size for evaluation with lm eval harness.')
+    parser.add_argument('--skip_ppl_eval', action='store_true', default=False,
+                        help='Skip WikiText2/C4 perplexity evaluation after quantization.')
     parser.add_argument(
         "--distribute_model",
         action="store_true",

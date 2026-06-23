@@ -10,6 +10,49 @@ import transformers
 
 from flatquant.function_utils import set_require_grad_all, get_n_set_parameters_byname, get_paras_dict_by_name, check_params_grad
 from flatquant.quant_utils import set_quantizer_state
+from flatquant.model_tools.model_access import (
+    first_hidden_state,
+    get_transformer_backbone,
+    get_transformer_config,
+    get_transformer_layers,
+    is_exaone45_model,
+)
+
+def _repeat_to_batch(value, batch_size):
+    if value is None:
+        return None
+    if isinstance(value, tuple):
+        return tuple(_repeat_to_batch(item, batch_size) for item in value)
+    if torch.is_tensor(value) and value.dim() > 0 and value.shape[0] == 1 and batch_size > 1:
+        return value.repeat((batch_size,) + (1,) * (value.dim() - 1))
+    return value
+
+
+def _build_exaone45_masks(config, sample_hidden_states, position_ids, cache_position):
+    from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+
+    if cache_position is None:
+        cache_position = torch.arange(sample_hidden_states.shape[1], device=sample_hidden_states.device)
+    mask_kwargs = {
+        "config": config,
+        "inputs_embeds": sample_hidden_states,
+        "attention_mask": None,
+        "cache_position": cache_position,
+        "past_key_values": None,
+        "position_ids": position_ids,
+    }
+    masks = {"full_attention": create_causal_mask(**mask_kwargs)}
+    if "sliding_attention" in getattr(config, "layer_types", []):
+        masks["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+    return masks
+
+
+def _select_layer_mask(mask_mapping, config, layer_idx, default_mask):
+    if mask_mapping is None:
+        return default_mask
+    layer_type = config.layer_types[layer_idx]
+    return mask_mapping[layer_type]
+
 
 def cali_flat_quant(args, model, dataloader, dev, logger):
     model.eval()
@@ -28,16 +71,19 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
         dtype = torch.float16 if isinstance(model, transformers.LlamaForCausalLM) else torch.bfloat16
         traincast = functools.partial(torch.amp.autocast, device_type="cuda", dtype=dtype)
 
+    backbone = get_transformer_backbone(model)
+    config = get_transformer_config(model)
+    layers = get_transformer_layers(model)
+
     # move embedding layer and first layer to target device
-    layers = model.model.layers
     layers[0] = layers[0].to(dev)
-    model.model.embed_tokens = model.model.embed_tokens.to(dev)
-    if hasattr(model.model, "rotary_emb"):
-        model.model.rotary_emb = model.model.rotary_emb.to(dev)
+    backbone.embed_tokens = backbone.embed_tokens.to(dev)
+    if hasattr(backbone, "rotary_emb"):
+        backbone.rotary_emb = backbone.rotary_emb.to(dev)
 
     # catch the first layer input
     inps = torch.zeros(
-        (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
+        (args.nsamples, model.seqlen, config.hidden_size), dtype=dtype, device=dev
     )
     cache = {"i": 0}
     class Catcher(nn.Module):
@@ -48,8 +94,10 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
         def forward(self, inp, **kwargs):
             inps[cache["i"]] = inp
             cache["i"] += 1
-            cache["attention_mask"] = kwargs["attention_mask"]
-            cache["position_ids"] = kwargs["position_ids"]
+            cache["attention_mask"] = kwargs.get("attention_mask")
+            cache["position_ids"] = kwargs.get("position_ids")
+            cache["position_embeddings"] = kwargs.get("position_embeddings")
+            cache["cache_position"] = kwargs.get("cache_position")
             raise ValueError
     layers[0] = Catcher(layers[0])
     with torch.no_grad():
@@ -62,30 +110,40 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
             except ValueError:
                 pass
     position_ids = cache["position_ids"]
+    position_embeddings = cache.get("position_embeddings")
+    cache_position = cache.get("cache_position")
     attention_mask = cache["attention_mask"]
     if attention_mask is not None:
         attention_mask_batch = attention_mask.repeat(args.cali_bsz, 1, 1, 1).float()
     else:
         attention_mask_batch = None
-    
+
+    mask_mapping = None
+    mask_mapping_batch = None
+    if is_exaone45_model(model):
+        sample_hidden_states = inps[:1]
+        mask_mapping = _build_exaone45_masks(config, sample_hidden_states, position_ids, cache_position)
+        mask_mapping_batch = {name: _repeat_to_batch(mask, args.cali_bsz) for name, mask in mask_mapping.items()}
+
+    position_ids_batch = _repeat_to_batch(position_ids, args.cali_bsz)
+    position_embeddings_batch = _repeat_to_batch(position_embeddings, args.cali_bsz)
+
     # move embedding layer and first layer to cpu
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
-    model.model.embed_tokens = model.model.embed_tokens.cpu()
-    if hasattr(model.model, "rotary_emb"):
-        model.model.rotary_emb = model.model.rotary_emb.cpu()
-    # raise ValueError("Only support for llama-2/Llama-3/qwen-2 now")
+    backbone.embed_tokens = backbone.embed_tokens.cpu()
+    if hasattr(backbone, "rotary_emb"):
+        backbone.rotary_emb = backbone.rotary_emb.cpu()
     torch.cuda.empty_cache()
 
     # same input of first layer for fp model and quant model
-    fp_inps = inps   # take output of fp model as input
-    fp_outs = torch.zeros_like(inps)   # take output of fp model as input
+    fp_inps = inps
+    fp_outs = torch.zeros_like(inps)
 
     loss_func = torch.nn.MSELoss()
     # start training
     flat_parameters = {}
     num_train_layer = len(layers)
-    mse_dict = {}
     for i in range(num_train_layer):
         logger.info(f"========= Layer {i} =========")
         dtype_dict = {}
@@ -95,20 +153,31 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
         with torch.no_grad():
             layer.float()
 
+        mask = _select_layer_mask(mask_mapping, config, i, attention_mask)
+        mask_batch = _select_layer_mask(mask_mapping_batch, config, i, attention_mask_batch)
+
         layer.self_attn._ori_mode = True
         layer.mlp._ori_mode = True
-        with torch.no_grad():
+        with torch.no_grad(), traincast():
             for j in range(args.nsamples):
-                fp_outs[j] = layer(fp_inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                fp_outs[j] = first_hidden_state(
+                    layer(
+                        fp_inps[j].unsqueeze(0),
+                        attention_mask=mask,
+                        position_ids=position_ids,
+                        position_embeddings=position_embeddings,
+                    )
+                )
         layer.self_attn._ori_mode = False
         layer.mlp._ori_mode = False
-        if args.diag_init == "sq_style":
-            layer.self_attn.init_diag_scale(alpha=args.diag_alpha)
-            layer.mlp.init_diag_scale(alpha=args.diag_alpha)
-        elif args.diag_init == "one_style":
-            pass
-        else:
-            raise NotImplementedError
+        if args.add_diag:
+            if args.diag_init == "sq_style":
+                layer.self_attn.init_diag_scale(alpha=args.diag_alpha)
+                layer.mlp.init_diag_scale(alpha=args.diag_alpha)
+            elif args.diag_init == "one_style":
+                pass
+            else:
+                raise NotImplementedError
 
         layer = layer.to(dev)
         set_require_grad_all(layer, False)
@@ -133,15 +202,20 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
             scheduler = torch.optim.lr_scheduler.ChainedScheduler([scheduler_warmup, scheduler_main])
         else:
             scheduler = scheduler_main
-        # check_params_grad(layer)
-        # set_quantizer_state(layer, False)
         for epoch in range(args.epochs):
             mse = 0
             start_tick = time.time()
             with traincast():
                 for j in range(args.nsamples // args.cali_bsz):
                     index = j * args.cali_bsz
-                    quant_out = layer(fp_inps[index:index+args.cali_bsz,], attention_mask=attention_mask_batch, position_ids=position_ids)[0]
+                    quant_out = first_hidden_state(
+                        layer(
+                            fp_inps[index:index+args.cali_bsz,],
+                            attention_mask=mask_batch,
+                            position_ids=position_ids_batch,
+                            position_embeddings=position_embeddings_batch,
+                        )
+                    )
                     loss = loss_func(fp_outs[index:index+args.cali_bsz,], quant_out)
                     mse += loss.detach().cpu()
                     loss = loss / loss.clone().detach()
@@ -169,4 +243,3 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
     torch.cuda.empty_cache()
     model.config.use_cache = use_cache
     return model
-

@@ -15,7 +15,15 @@ def main():
 
     model, apply_flatquant_to_model = model_utils.get_model(args.model, args.hf_token)
     model.eval()
-    tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, use_fast=False, use_auth_token=args.hf_token)
+    tokenizer_kwargs = {"use_fast": True}
+    if args.hf_token is not None:
+        tokenizer_kwargs["token"] = args.hf_token
+    try:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, **tokenizer_kwargs)
+    except TypeError:
+        if "token" in tokenizer_kwargs:
+            tokenizer_kwargs["use_auth_token"] = tokenizer_kwargs.pop("token")
+        tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, **tokenizer_kwargs)
 
     # get calibration data
     trainloader = data_utils.get_loaders(
@@ -56,17 +64,18 @@ def main():
         model.to(utils.DEV)
     
     # Evaluating PPL
-    for eval_dataset in ["wikitext2", "c4"]:
-        logger.info(eval_dataset)
-        testloader = data_utils.get_loaders(
-                args,
-                eval_dataset,
-                tokenizer,
-                seqlen=model.seqlen,
-                eval_mode=True
-            )
-        dataset_ppl = eval_utils.ppl_eval(model, testloader)
-        logger.info(dataset_ppl)
+    if not args.skip_ppl_eval:
+        for eval_dataset in ["wikitext2", "c4"]:
+            logger.info(eval_dataset)
+            testloader = data_utils.get_loaders(
+                    args,
+                    eval_dataset,
+                    tokenizer,
+                    seqlen=model.seqlen,
+                    eval_mode=True
+                )
+            dataset_ppl = eval_utils.ppl_eval(model, testloader)
+            logger.info(dataset_ppl)
 
 
     if args.lm_eval:

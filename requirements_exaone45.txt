@@ -1,0 +1,21 @@
+# EXAONE-4.5 W-only FlatQuant calibration environment.
+#
+# Do not install requirements.txt in this environment: it pins
+# transformers==4.45.0, while EXAONE-4.5 needs the EXAONE 4.5 fork.
+#
+# Recommended setup:
+#   /venv/main/bin/python -m venv --system-site-packages /workspace/.venvs/flatquant-exaone
+#   source /workspace/.venvs/flatquant-exaone/bin/activate
+#   uv pip install -r requirements_exaone45.txt
+#   export PYTHONPATH=/workspace/FlatQuant:$PYTHONPATH
+
+git+https://github.com/nuxlear/transformers.git@add-exaone4_5-v5.3.0.dev0
+accelerate
+datasets==2.17.1
+lm-eval==0.4.9.1
+safetensors
+sentencepiece
+protobuf
+termcolor
+scipy
+tqdm
