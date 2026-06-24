@@ -170,7 +170,7 @@ def matmul_kernel(
     offs_resm = pid_m * M + tl.arange(0, np2_M)
     offs_resn = tl.arange(0, np2_N)
     res_ptrs = res_ptr + stride_resb.to(tl.int64) * batch_id + stride_resm * offs_resm[:, None] + stride_resn * offs_resn[None, :]
-    res_mask = (offs_resm[:, None] < M) & (offs_resn[None, :] < N // 2)
+    res_mask = (offs_resm[:, None] < M) & (offs_resn[None, :] < N)
     tl.store(res_ptrs, accumulator.to(tl.float16), mask=res_mask)
 
 
