@@ -63,6 +63,35 @@ python benchmarks/benchmark_exaone45_ppl.py \
   --model_path ./outputs/EXAONE-4.5-33B/w4a4/exaone45-33b-w4a4-e15-lr5e3-ppl \
   --dataset wikitext2 \
   --max_samples 100000
+
+PYTHONPATH=/workspace/FlatQuant /workspace/.venvs/flatquant-exaone/bin/python \
+  benchmarks/benchmark_exaone45_ppl.py \
+  --model_path LGAI-EXAONE/EXAONE-4.5-33B \
+  --model_kind original \
+  --tokenizer LGAI-EXAONE/EXAONE-4.5-33B \
+  --dataset wikitext2 \
+  --seqlen 2048 \
+  --max_samples 100000 \
+  --dtype bfloat16
+
+PYTHONPATH=/workspace/FlatQuant /workspace/.venvs/flatquant-exaone/bin/python \
+  benchmarks/benchmark_exaone45_latency.py \
+  --model_path ./outputs/EXAONE-4.5-33B/w4a4/exaone45-33b-w4a4-e15-lr5e3-ppl \
+  --model_kind flatquant \
+  --batch_size 1 \
+  --prefill_seq_len 2048 \
+  --decode_steps 256 \
+  --warmup_steps 2 \
+  --num_repeats 10
+
+PYTHONPATH=/workspace/FlatQuant /workspace/.venvs/flatquant-exaone/bin/python \
+  benchmarks/benchmark_exaone45_latency.py \
+  --model_path LGAI-EXAONE/EXAONE-4.5-33B \
+  --model_kind original \
+  --dtype bfloat16 \
+  --batch_size 1 \
+  --prefill_seq_len 2048 \
+  --decode_steps 256
 ```
 
 확인된 full WikiText2 PPL: `8.5260`.
