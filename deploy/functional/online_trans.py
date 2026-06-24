@@ -1,3 +1,4 @@
+import os
 import torch, math
 import fast_hadamard_transform
 from deploy.kernels.kron_matmul import kron_matmul
@@ -110,6 +111,48 @@ def quant(x, clip_factor_a_max = 1.0, clip_factor_a_min = 1.0, input_clip_ratio=
     return packed_tensor
 
 
+def _as_clip_tensor(value, x):
+    if torch.is_tensor(value):
+        return value.to(device=x.device)
+    return torch.tensor(value, device=x.device, dtype=torch.float32)
+
+
+def _quant_lac(x, clip_factor_a_max=1.0, clip_factor_a_min=1.0):
+    reshaped_x = x.reshape((-1, x.shape[-1]))
+    xmax, xmin = reshaped_x.amax(1, keepdim=True), reshaped_x.amin(1, keepdim=True)
+    zeros = torch.zeros_like(xmax)
+    xmax, xmin = torch.maximum(xmax, zeros), torch.minimum(xmin, zeros)
+
+    clip_factor_a_max = _as_clip_tensor(clip_factor_a_max, x)
+    clip_factor_a_min = _as_clip_tensor(clip_factor_a_min, x)
+    xmax = xmax * torch.sigmoid(clip_factor_a_max)
+    xmin = xmin * torch.sigmoid(clip_factor_a_min)
+
+    xmax = torch.maximum(torch.abs(xmin), xmax)
+    zeros = xmax == 0
+    scales_x = xmax / 7
+    scales_x[zeros] = 1
+    scales_x = scales_x.to(torch.float16)
+
+    quantized_x = deploy.sym_quant(x, scales_x)
+    return deploy.PackedQuantizedTensor(quantized_x, scales_x)
+
+
+def _torch_kronecker_matmul_quant(x, invL, invR, clip_factor_a_max, clip_factor_a_min):
+    x = torch.matmul(torch.matmul(invL, x), invR)
+    x = x.reshape(x.shape[0], -1)
+    return _quant_lac(x, clip_factor_a_max, clip_factor_a_min)
+
+
+def _kron_backend(invL):
+    backend = os.getenv("FLATQUANT_KRON_BACKEND", "auto").lower()
+    if backend not in {"auto", "triton", "torch"}:
+        raise ValueError(f"Unsupported FLATQUANT_KRON_BACKEND={backend}")
+    if backend == "auto":
+        return "torch" if invL.shape[0] > 64 else "triton"
+    return backend
+
+
 def kronecker_matmul(x, invs, clip_factor_a_max = 1.0, clip_factor_a_min = 1.0, use_lac = None):
     init_shape = x.shape
     if len(invs) == 2:
@@ -117,9 +160,14 @@ def kronecker_matmul(x, invs, clip_factor_a_max = 1.0, clip_factor_a_min = 1.0, 
         invL, invR = invs
         invL = invL.T.contiguous()
         x = x.reshape(-1, invL.shape[0], invR.shape[0])
-        x = kron_matmul(invL, x, invR, seq_len, clip_factor_a_max, clip_factor_a_min)
+        if _kron_backend(invL) == "torch":
+            x = _torch_kronecker_matmul_quant(
+                x, invL, invR, clip_factor_a_max, clip_factor_a_min
+            )
+        else:
+            x = kron_matmul(invL, x, invR, seq_len, clip_factor_a_max, clip_factor_a_min)
         x.quantized_x = x.quantized_x.reshape(bsz, seq_len, -1)
-        x.scales_x = x.scales_x.reshape(bsz, 1, seq_len)
+        x.scales_x = x.scales_x.reshape(bsz, seq_len, 1)
     elif len(invs) == 1:
         bsz, seq_len, head_dim, num_heads = init_shape
         inv = invs[0]
