@@ -63,5 +63,8 @@ class OnlineTrans(torch.nn.Module):
                 invs.append(self.left_matrix)
             if hasattr(self, "right_matrix"):
                 invs.append(self.right_matrix)
-            x = deploy.functional.online_trans.kronecker_matmul(x, invs, self.clip_factor_a_max, self.clip_factor_a_min)
+            x = deploy.functional.online_trans.kronecker_matmul(
+                x, invs, self.clip_factor_a_max, self.clip_factor_a_min,
+                use_lac=self.lac if self.lac else None,
+            )
         return x
