@@ -8,6 +8,11 @@ from pathlib import Path
 import numpy as np
 import torch
 import transformers
+from safetensors import safe_open
+try:
+    from transformers.modeling_utils import no_init_weights
+except ImportError:
+    from transformers.initialization import no_init_weights
 from tqdm import tqdm
 
 import flatquant.data_utils as data_utils
@@ -61,6 +66,29 @@ def _is_flatquant_checkpoint(model_path):
     config = _load_json(config_path)
     quant_config = config.get("quantization_config") or {}
     return quant_config.get("quant_method") == "flatquant" or quant_config.get("real_runtime") == "flatquant"
+
+
+def _load_quantization_config(model_path):
+    model_path = Path(model_path)
+    config_path = model_path / "quantization_config.json"
+    if config_path.exists():
+        return _load_json(config_path)
+
+    hf_config_path = model_path / "config.json"
+    if hf_config_path.exists():
+        config = _load_json(hf_config_path)
+        return config.get("quantization_config") or {}
+
+    return {}
+
+
+def _is_weight_only_flatquant(quant_config):
+    if not quant_config:
+        return False
+    return int(quant_config.get("w_bits", 16)) < 16 and all(
+        int(quant_config.get(name, 16)) >= 16
+        for name in ("a_bits", "q_bits", "k_bits", "v_bits")
+    )
 
 
 def _normalize_exaone45_config(config):
@@ -133,11 +161,216 @@ def _load_original_model(model_path, device, dtype, hf_token):
     return model.eval().to(device=device)
 
 
-def _load_flatquant_model(model_path, device):
+def _iter_safetensor_paths(model_path):
+    model_path = Path(model_path)
+    index_path = model_path / "model.safetensors.index.json"
+    if index_path.exists():
+        index = _load_json(index_path)
+        filenames = list(dict.fromkeys(index["weight_map"].values()))
+        return [model_path / filename for filename in filenames]
+
+    single_path = model_path / "model.safetensors"
+    if single_path.exists():
+        return [single_path]
+
+    raise FileNotFoundError(f"No safetensors checkpoint found under {model_path}")
+
+
+def _unpack_signed_i4(packed):
+    lo = (packed & 0x0F).to(torch.int16)
+    hi = ((packed >> 4) & 0x0F).to(torch.int16)
+    unpacked = torch.empty(
+        packed.shape[:-1] + (packed.shape[-1] * 2,),
+        dtype=torch.int16,
+        device=packed.device,
+    )
+    unpacked[..., 0::2] = lo
+    unpacked[..., 1::2] = hi
+    unpacked = torch.where(unpacked >= 8, unpacked - 16, unpacked)
+    return unpacked.to(torch.int8)
+
+
+def _dequantize_packed_i4_weight(packed_weight, scale, dtype):
+    unpacked = _unpack_signed_i4(packed_weight).to(torch.float32)
+    return (unpacked * scale.to(torch.float32)).to(dtype).contiguous()
+
+
+def _quantizer_scale_key(weight_key):
+    return f"quantizer.{weight_key[:-len('.weight')]}.scale"
+
+
+def _assign_tensor(module, name, tensor):
+    parent_name, attr_name = name.rsplit(".", 1)
+    parent = module.get_submodule(parent_name)
+    current = getattr(parent, attr_name)
+    if isinstance(current, torch.nn.Parameter):
+        if tensor.is_floating_point() and current.is_floating_point():
+            tensor = tensor.to(dtype=current.dtype)
+        setattr(parent, attr_name, torch.nn.Parameter(tensor.contiguous(), requires_grad=current.requires_grad))
+    elif attr_name in parent._buffers:
+        if tensor.is_floating_point() and current is not None and current.is_floating_point():
+            tensor = tensor.to(dtype=current.dtype)
+        parent._buffers[attr_name] = tensor.contiguous()
+    else:
+        setattr(parent, attr_name, tensor.contiguous())
+
+
+def _collect_weight_scales(model_path):
+    scales = {}
+    for shard_path in _iter_safetensor_paths(model_path):
+        with safe_open(str(shard_path), framework="pt") as f:
+            for key in f.keys():
+                if key.startswith("quantizer.") and key.endswith(".scale"):
+                    scales[key] = f.get_tensor(key).cpu()
+    return scales
+
+
+def _flatquant_args_from_config(quant_config):
+    return types.SimpleNamespace(
+        w_bits=int(quant_config.get("w_bits", 4)),
+        a_bits=int(quant_config.get("a_bits", 16)),
+        q_bits=int(quant_config.get("q_bits", 16)),
+        k_bits=int(quant_config.get("k_bits", 16)),
+        v_bits=int(quant_config.get("v_bits", 16)),
+        w_asym=not quant_config.get("symmetric", True),
+        a_asym=False,
+        q_asym=False,
+        k_asym=False,
+        v_asym=False,
+        a_groupsize=-1,
+        q_groupsize=-1,
+        k_groupsize=-1,
+        v_groupsize=-1,
+        lac=False,
+        lwc=False,
+        cali_trans=True,
+        add_diag=False,
+        direct_inv=False,
+        separate_vtrans=False,
+    )
+
+
+def _set_flatquant_eval_flags(model):
+    for module in model.modules():
+        if hasattr(module, "_ori_mode"):
+            module._ori_mode = False
+        if hasattr(module, "_eval_mode"):
+            module._eval_mode = True
+
+
+def _prepare_flatquant_eval_modules(model):
+    for module in model.modules():
+        to_eval_mode = getattr(module, "to_eval_mode", None)
+        if callable(to_eval_mode):
+            to_eval_mode()
+    _set_flatquant_eval_flags(model)
+
+
+def _is_runtime_state_key(key):
+    if key.startswith("quantizer."):
+        return False
+    if ".clip_factor_w_" in key:
+        return False
+    return True
+
+
+def _load_flatquant_weight_only_model(model_path, device, dtype, hf_token):
+    from flatquant.model_tools.exaone45_utils import apply_flatquant_to_exaone45
+
+    model_path = Path(model_path)
+    quant_config = _load_quantization_config(model_path)
+    if int(quant_config.get("w_bits", 16)) != 4:
+        raise NotImplementedError("weight_only FlatQuant PPL currently supports packed W4 checkpoints only.")
+    if not quant_config.get("symmetric", True):
+        raise NotImplementedError("weight_only FlatQuant PPL currently supports symmetric packed int4 only.")
+
+    dtype = _parse_dtype(dtype)
+    if dtype == "auto":
+        dtype = torch.float16
+
+    config_kwargs = {"trust_remote_code": True}
+    if hf_token:
+        config_kwargs["token"] = hf_token
+    config = transformers.AutoConfig.from_pretrained(str(model_path), **config_kwargs)
+    config = _normalize_exaone45_config(config)
+    if hasattr(config, "quantization_config"):
+        config.quantization_config = None
+
+    model_cls = (
+        Exaone4_5_ForConditionalGeneration
+        if getattr(config, "model_type", None) == "exaone4_5"
+        else transformers.AutoModelForCausalLM
+    )
+
+    dtype_old = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    with no_init_weights():
+        model = model_cls(config)
+    torch.set_default_dtype(dtype_old)
+
+    model = apply_flatquant_to_exaone45(_flatquant_args_from_config(quant_config), model)
+    _prepare_flatquant_eval_modules(model)
+    if hasattr(model, "generation_config"):
+        model.generation_config.cache_implementation = None
+
+    target_names = set(model.state_dict().keys())
+    scales = _collect_weight_scales(model_path)
+    loaded_names = set()
+    skipped_packed = []
+
+    for shard_path in _iter_safetensor_paths(model_path):
+        with safe_open(str(shard_path), framework="pt") as f:
+            for key in f.keys():
+                if not _is_runtime_state_key(key) or key not in target_names:
+                    continue
+
+                tensor = f.get_tensor(key).cpu()
+                if key.endswith(".linear.weight") and tensor.dtype == torch.uint8:
+                    scale = scales.get(_quantizer_scale_key(key))
+                    if scale is None:
+                        skipped_packed.append(key)
+                        continue
+                    tensor = _dequantize_packed_i4_weight(tensor, scale, dtype)
+                elif tensor.is_floating_point():
+                    tensor = tensor.to(dtype)
+
+                _assign_tensor(model, key, tensor)
+                loaded_names.add(key)
+
+    if skipped_packed:
+        raise KeyError(f"Missing quantizer scales for {len(skipped_packed)} packed weights; first: {skipped_packed[0]}")
+
+    missing_runtime = sorted(
+        name for name in target_names - loaded_names
+        if name.startswith(("model.language_model.", "lm_head."))
+        and ".weight_quantizer." not in name
+        and ".act_quantizer." not in name
+        and ".clip_factor_w_" not in name
+    )
+    if missing_runtime:
+        print(f"Warning: {len(missing_runtime)} language-model tensors were not loaded; first: {missing_runtime[:5]}")
+
+    _set_flatquant_eval_flags(model)
+    return model.eval().to(device=device, dtype=dtype)
+
+
+def _resolve_flatquant_eval_mode(model_path, requested_mode):
+    if requested_mode != "auto":
+        return requested_mode
+    quant_config = _load_quantization_config(model_path)
+    return "weight_only" if _is_weight_only_flatquant(quant_config) else "deploy"
+
+
+def _load_flatquant_model(model_path, device, dtype, hf_token, eval_mode):
+    eval_mode = _resolve_flatquant_eval_mode(model_path, eval_mode)
+    if eval_mode == "weight_only":
+        model = _load_flatquant_weight_only_model(model_path, device, dtype, hf_token)
+        return model, eval_mode
+
     model = FlatQuantExaone45ForConditionalGeneration.from_pretrained(model_path)
     if hasattr(model, "config") and hasattr(model.config, "quantization_config"):
         model.config.quantization_config = None
-    return model.eval().to(device=device, dtype=torch.float16)
+    return model.eval().to(device=device, dtype=torch.float16), eval_mode
 
 
 def _default_output_path(model_path, dataset, nsamples):
@@ -214,10 +447,19 @@ def main():
     parser.add_argument("--max_samples", type=int, default=4)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
+        "--flatquant_eval_mode",
+        default="auto",
+        choices=["auto", "deploy", "weight_only"],
+        help=(
+            "FlatQuant evaluation path. auto uses deploy for W4A4/KV4 checkpoints and "
+            "weight_only for W4A16-style checkpoints."
+        ),
+    )
+    parser.add_argument(
         "--dtype",
         default="float16",
         choices=["auto", "float16", "fp16", "bfloat16", "bf16", "float32", "fp32"],
-        help="Model dtype for original baseline loading. FlatQuant deploy uses float16.",
+        help="Model dtype for original baseline and FlatQuant weight_only loading. FlatQuant deploy uses float16.",
     )
     parser.add_argument("--no_warmup", action="store_true")
     parser.add_argument("--output_path", default=None)
@@ -246,9 +488,17 @@ def main():
     )
 
     if model_kind == "flatquant":
-        print(f"Loading FlatQuant checkpoint: {args.model_path}")
-        model = _load_flatquant_model(args.model_path, args.device)
+        flatquant_eval_mode = _resolve_flatquant_eval_mode(args.model_path, args.flatquant_eval_mode)
+        print(f"Loading FlatQuant checkpoint ({flatquant_eval_mode}): {args.model_path}")
+        model, flatquant_eval_mode = _load_flatquant_model(
+            args.model_path,
+            args.device,
+            args.dtype,
+            args.hf_token,
+            flatquant_eval_mode,
+        )
     else:
+        flatquant_eval_mode = None
         print(f"Loading original baseline model: {args.model_path}")
         model = _load_original_model(args.model_path, args.device, args.dtype, args.hf_token)
 
@@ -260,6 +510,8 @@ def main():
         warmup=not args.no_warmup,
     )
     result.update({"dataset": args.dataset, "model_kind": model_kind, "model_path": args.model_path})
+    if flatquant_eval_mode is not None:
+        result["flatquant_eval_mode"] = flatquant_eval_mode
     print(json.dumps(result, indent=2, sort_keys=True))
 
     output_path = args.output_path
