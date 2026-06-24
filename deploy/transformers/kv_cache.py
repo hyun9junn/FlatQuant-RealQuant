@@ -393,14 +393,16 @@ class MultiLayerPagedKVCache4Bit(Cache):
 
 class HFCacheAdapter(Cache):
     def __init__(self, inner):
-        super().__init__()
         self.inner = inner
 
     def get_usable_length(self, kv_seq_len: int, layer_idx: int) -> int:
         return self.inner.get_usable_length(kv_seq_len, layer_idx)
 
-    def get_seq_length(self) -> int:
-        return self.inner.get_seq_length()
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+        return self.inner.get_seq_length(layer_idx)
+
+    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> tuple[int, int]:
+        return self.inner.get_seq_length(layer_idx) + cache_position.shape[0], 0
 
     def get_max_length(self) -> int:
         return self.inner.get_max_length()

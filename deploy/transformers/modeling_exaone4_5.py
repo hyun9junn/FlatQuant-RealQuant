@@ -27,6 +27,12 @@ import deploy
 DEFAULT_ONLINE_TRANS = ["qk", "o_proj", "down_proj", "qkv_proj", "up_gate_proj"]
 
 
+def _set_exaone45_attn_implementation(config, attn_implementation):
+    config._attn_implementation = attn_implementation
+    if hasattr(config, "text_config"):
+        config.text_config._attn_implementation = attn_implementation
+
+
 
 def _share_buffer(module, name, tensor):
     if name in module._buffers:
@@ -182,11 +188,9 @@ class FlatQuantExaone45MLP(Exaone4_5_MLP):
 
 class FlatQuantExaone45ForConditionalGeneration(Exaone4_5_ForConditionalGeneration):
     def __init__(self, args, config):
-        config._attn_implementation = "eager"
+        _set_exaone45_attn_implementation(config, args.attn_implementation)
         config.num_nextn_predict_layers = 0
         config._num_mtp_layers = 0
-        if hasattr(config, "text_config"):
-            config.text_config._attn_implementation = "eager"
         super().__init__(config)
         self.args = args
         layers = self.model.language_model.layers
@@ -199,6 +203,7 @@ class FlatQuantExaone45ForConditionalGeneration(Exaone4_5_ForConditionalGenerati
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name, **kwargs):
+        attn_implementation = kwargs.pop("attn_implementation", None)
         config = _load_exaone45_config(cls.config_class, pretrained_model_name, kwargs)
         quant_config = getattr(config, "quantization_config", {}) or {}
 
@@ -206,6 +211,7 @@ class FlatQuantExaone45ForConditionalGeneration(Exaone4_5_ForConditionalGenerati
         args.fuseLN = quant_config.get("fuseLN", False)
         args.trans = quant_config.get("trans", "matmul")
         args.online_trans = set(quant_config.get("online_trans", DEFAULT_ONLINE_TRANS))
+        args.attn_implementation = attn_implementation or quant_config.get("attn_implementation", "eager")
 
         dtype_old = torch.get_default_dtype()
         torch.set_default_dtype(torch.float16)
