@@ -92,19 +92,19 @@ def matmul_quant_kernel(
     quant_val = libdevice.llrint(accumulator_T / scale)
     quant_val = tl.maximum(-8, tl.minimum(quant_val, 7))
 
-
-    quant_val = quant_val.reshape(np2_M, np2_N // 2, 2, can_reorder=False)
+    quant_val = quant_val.reshape(np2_N, np2_M // 2, 2, can_reorder=False)
     quant_val_even, quant_val_odd = quant_val.split()
     quant_val_odd = quant_val_odd << 4
 
-    res = tl.zeros((np2_M, np2_N // 2), dtype=tl.int8)
+    res = tl.zeros((np2_N, np2_M // 2), dtype=tl.uint8)
     res = res | (quant_val_odd & 0xf0)
     res = res | (quant_val_even & 0x0f)
 
-    offs_resm = pid_m * M + tl.arange(0, np2_M)
-    offs_resn = tl.arange(0, np2_N // 2)
-    res_ptrs = res_ptr + stride_resb.to(tl.int64) * batch_id + stride_resm * offs_resm[:, None] + stride_resn * offs_resn[None, :]
-    res_mask = (offs_resm[:, None] < M) & (offs_resn[None, :] < N // 2)
+    offs_resn = tl.arange(0, np2_N)
+    offs_resm_pair = tl.arange(0, np2_M // 2)
+    packed_offsets = offs_resn[:, None] * (M // 2) + offs_resm_pair[None, :]
+    res_ptrs = res_ptr + stride_resb.to(tl.int64) * batch_id + packed_offsets
+    res_mask = (offs_resn[:, None] < N) & (offs_resm_pair[None, :] < M // 2)
     tl.store(res_ptrs, res, mask=res_mask)
     tl.store(output_scale + batch_id, scale.to(tl.float16))
 
@@ -223,18 +223,19 @@ def quant_kernel(
     src_T = tl.trans(src)
     quant_val = libdevice.llrint(src_T / scale)
     quant_val = tl.maximum(-8, tl.minimum(quant_val, 7))
-    quant_val = quant_val.reshape(np2_M,  np2_N // 2, 2, can_reorder=False)
+    quant_val = quant_val.reshape(np2_N,  np2_M // 2, 2, can_reorder=False)
     quant_val_even, quant_val_odd = quant_val.split()
     quant_val_odd = quant_val_odd << 4
 
-    res = tl.zeros((np2_M, np2_N // 2), dtype=tl.uint8)
+    res = tl.zeros((np2_N, np2_M // 2), dtype=tl.uint8)
     res = res | (quant_val_odd & 0xf0)
     res = res | (quant_val_even & 0x0f)
 
-    offs_resm = tl.arange(0, np2_M)
-    offs_resn = tl.arange(0, np2_N // 2)
-    dst_ptrs = dst_ptr + stride_dstb.to(tl.int64) * batch_id + stride_dstm * offs_resm[:, None] + stride_dstn * offs_resn[None, :]
-    res_mask = (offs_resm[:, None] < M) & (offs_resn[None, :] < N // 2)
+    offs_resn = tl.arange(0, np2_N)
+    offs_resm_pair = tl.arange(0, np2_M // 2)
+    packed_offsets = offs_resn[:, None] * (M // 2) + offs_resm_pair[None, :]
+    dst_ptrs = dst_ptr + stride_dstb.to(tl.int64) * batch_id + packed_offsets
+    res_mask = (offs_resn[:, None] < N) & (offs_resm_pair[None, :] < M // 2)
     tl.store(dst_ptrs, res, mask=res_mask)
     tl.store(output_scale + batch_id, scale)
 
@@ -262,9 +263,11 @@ def block_matmul(b, c, seq_len, clip_factor_a_max, clip_factor_a_min, just_quant
     # TODO: handle shared memory issue. In this setting, A100 can't get full speedup.
     #np2_M = min(triton.next_power_of_2(M), 128)
     #np2_N = min(triton.next_power_of_2(N), 64)
-    # TODO: want N, M power of 2.
-    np2_M = M
-    np2_N = N
+    # Triton tl.arange requires power-of-two ranges. Kernels mask back to
+    # the real M/N extents, so non-power-of-two head dims can use padded
+    # compile-time tile sizes here.
+    np2_M = triton.next_power_of_2(M)
+    np2_N = triton.next_power_of_2(N)
 
     # 1D launch kernel where each block gets its own program.
     if just_quantize:
