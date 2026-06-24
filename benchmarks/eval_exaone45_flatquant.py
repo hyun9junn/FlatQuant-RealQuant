@@ -11,6 +11,9 @@ import transformers
 from deploy.transformers.modeling_exaone4_5 import (
     FlatQuantExaone45ForConditionalGeneration,
 )
+from transformers.models.exaone4_5.modeling_exaone4_5 import (
+    Exaone4_5_ForConditionalGeneration,
+)
 
 
 def _patch_lm_eval_text_imports():
@@ -53,7 +56,11 @@ def _load_json(path):
 
 
 def _infer_tokenizer_name(model_path):
-    config_path = Path(model_path) / "quantization_config.json"
+    model_path = Path(model_path)
+    if (model_path / "tokenizer.json").exists() or (model_path / "tokenizer_config.json").exists():
+        return str(model_path)
+
+    config_path = model_path / "quantization_config.json"
     if config_path.exists():
         quant_config = _load_json(config_path)
         model_name = quant_config.get("model_name")
@@ -73,6 +80,50 @@ def _infer_tokenizer_name(model_path):
 
     return None
 
+
+
+def _is_flatquant_checkpoint(model_path):
+    if (Path(model_path) / "quantization_config.json").exists():
+        return True
+    config_path = Path(model_path) / "config.json"
+    if not config_path.exists():
+        return False
+    config = _load_json(config_path)
+    quant_config = config.get("quantization_config") or {}
+    return quant_config.get("quant_method") == "flatquant"
+
+
+def _normalize_exaone45_config(config):
+    if getattr(config, "model_type", None) != "exaone4_5":
+        return config
+
+    config._attn_implementation = "eager"
+    config.num_nextn_predict_layers = 0
+    config._num_mtp_layers = 0
+
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None:
+        text_config._attn_implementation = "eager"
+        text_config.num_nextn_predict_layers = 0
+        text_config._num_mtp_layers = 0
+        num_layers = getattr(text_config, "num_hidden_layers", None)
+        layer_types = getattr(text_config, "layer_types", None)
+        if isinstance(num_layers, int) and isinstance(layer_types, list):
+            text_config.layer_types = layer_types[:num_layers]
+    return config
+
+
+def _parse_dtype(dtype):
+    dtype = dtype.lower()
+    if dtype in {"float16", "fp16", "half"}:
+        return torch.float16
+    if dtype in {"bfloat16", "bf16"}:
+        return torch.bfloat16
+    if dtype in {"float32", "fp32"}:
+        return torch.float32
+    if dtype == "auto":
+        return "auto"
+    raise ValueError(f"Unsupported dtype: {dtype}")
 
 def _load_tokenizer(tokenizer_name, hf_token):
     kwargs = {"use_fast": True}
@@ -138,6 +189,12 @@ def main():
     parser.add_argument("--limit", type=float, default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
+        "--dtype",
+        default="float16",
+        choices=["auto", "float16", "fp16", "bfloat16", "bf16", "float32", "fp32"],
+        help="Model dtype for original baseline loading. FlatQuant deploy still uses float16.",
+    )
+    parser.add_argument(
         "--output_path",
         default=None,
         help="Optional JSON output path. Defaults under <model_path>/lm_eval_results.",
@@ -159,11 +216,34 @@ def main():
     torch.set_grad_enabled(False)
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    print(f"Loading FlatQuant checkpoint: {args.model_path}")
-    model = FlatQuantExaone45ForConditionalGeneration.from_pretrained(args.model_path)
-    if hasattr(model, "config") and hasattr(model.config, "quantization_config"):
-        model.config.quantization_config = None
-    model.eval().to(device=args.device, dtype=torch.float16)
+    if _is_flatquant_checkpoint(args.model_path):
+        print(f"Loading FlatQuant checkpoint: {args.model_path}")
+        model = FlatQuantExaone45ForConditionalGeneration.from_pretrained(args.model_path)
+        if hasattr(model, "config") and hasattr(model.config, "quantization_config"):
+            model.config.quantization_config = None
+        model.eval().to(device=args.device, dtype=torch.float16)
+    else:
+        print(f"Loading original baseline model: {args.model_path}")
+        dtype = _parse_dtype(args.dtype)
+        config_kwargs = {"trust_remote_code": True}
+        model_kwargs = {"trust_remote_code": True, "low_cpu_mem_usage": True}
+        if args.hf_token:
+            config_kwargs["token"] = args.hf_token
+            model_kwargs["token"] = args.hf_token
+        config = transformers.AutoConfig.from_pretrained(args.model_path, **config_kwargs)
+        config = _normalize_exaone45_config(config)
+        model_kwargs["config"] = config
+        if dtype != "auto":
+            model_kwargs["torch_dtype"] = dtype
+        model_cls = (
+            Exaone4_5_ForConditionalGeneration
+            if getattr(config, "model_type", None) == "exaone4_5"
+            else transformers.AutoModelForCausalLM
+        )
+        model = model_cls.from_pretrained(args.model_path, **model_kwargs)
+        if hasattr(model, "generation_config"):
+            model.generation_config.cache_implementation = None
+        model.eval().to(device=args.device)
 
     print(f"Loading tokenizer: {tokenizer_name}")
     tokenizer = _load_tokenizer(tokenizer_name, args.hf_token)
