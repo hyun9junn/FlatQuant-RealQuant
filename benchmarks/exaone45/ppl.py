@@ -403,7 +403,7 @@ def ppl_eval(model, testenc, seqlen=2048, max_samples=None, warmup=True):
         raise ValueError("No PPL samples available for the requested seqlen/max_samples.")
 
     if warmup:
-        _ = model(input_ids[:, :seqlen])
+        _ = model(input_ids[:, :seqlen], use_cache=False)
         torch.cuda.synchronize()
 
     nlls = []
@@ -413,7 +413,7 @@ def ppl_eval(model, testenc, seqlen=2048, max_samples=None, warmup=True):
         batch = input_ids[:, i * seqlen : (i + 1) * seqlen]
         torch.cuda.synchronize()
         start = time.perf_counter()
-        lm_logits = model(batch).logits
+        lm_logits = model(batch, use_cache=False).logits
         torch.cuda.synchronize()
         end = time.perf_counter()
 
@@ -462,6 +462,8 @@ def _run_ppl_dataset(args, spec, model, metadata, tokenizer, tokenizer_name, dat
             "model_path": spec.path,
             "dtype": spec.dtype,
             "tokenizer": tokenizer_name,
+            "attn_implementation": args.attn_implementation,
+            "use_cache": False,
         }
     )
     if metadata.get("flatquant_eval_mode") is not None:
@@ -494,7 +496,7 @@ def _run_ppl_for_spec(args, spec, datasets, output_path=None, output_dir=None):
             spec,
             device=args.device,
             hf_token=args.hf_token,
-            attn_implementation="eager",
+            attn_implementation=args.attn_implementation,
         )
         print(f"Model ready: {spec.label}. Running datasets: {', '.join(datasets)}")
 
@@ -592,6 +594,11 @@ def main():
     parser.add_argument("--seqlen", type=int, default=2048)
     parser.add_argument("--max_samples", type=int, default=4)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--attn_implementation",
+        default="sdpa",
+        choices=["eager", "sdpa", "flash_attention_2"],
+    )
     parser.add_argument(
         "--flatquant_eval_mode",
         default="auto",

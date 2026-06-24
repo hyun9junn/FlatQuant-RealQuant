@@ -519,7 +519,7 @@ def main():
     parser.add_argument("--flatquant_device_map", default=None)
     parser.add_argument(
         "--attn_implementation",
-        default="eager",
+        default="sdpa",
         choices=["eager", "sdpa", "flash_attention_2"],
         help="Attention backend for EXAONE text attention.",
     )

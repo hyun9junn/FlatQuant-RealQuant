@@ -286,6 +286,7 @@ def _build_exaone_lmms_class(lmms_base, GenerationResult, TokenCounts):
             device: str,
             batch_size: int,
             hf_token: Optional[str],
+            attn_implementation: str,
             min_pixels: Optional[int],
             max_pixels: Optional[int],
             image_message_mode: str,
@@ -327,7 +328,7 @@ def _build_exaone_lmms_class(lmms_base, GenerationResult, TokenCounts):
                 spec,
                 device=device,
                 hf_token=hf_token,
-                attn_implementation="eager",
+                attn_implementation=attn_implementation,
             )
             self.flatquant_eval_mode = metadata.get("flatquant_eval_mode")
 
@@ -625,6 +626,7 @@ def run_one_model(args, spec: ModelSpec, tasks: Sequence[str], output_dir: Path)
             device=args.device,
             batch_size=args.batch_size,
             hf_token=args.hf_token,
+            attn_implementation=args.attn_implementation,
             min_pixels=args.min_pixels,
             max_pixels=args.max_pixels,
             image_message_mode=args.image_message_mode,
@@ -680,6 +682,8 @@ def run_one_model(args, spec: ModelSpec, tasks: Sequence[str], output_dir: Path)
             "tokenizer": spec.tokenizer,
             "processor": spec.processor,
             "flatquant_eval_mode": spec.flatquant_eval_mode if spec.kind == "flatquant" else None,
+            "attn_implementation": args.attn_implementation,
+            "use_cache": not args.no_use_cache,
             "summary": summary,
             "results": results,
         }
@@ -729,6 +733,11 @@ def main():
     loading_group = parser.add_argument_group("model loading")
     loading_group.add_argument("--hf_token", default=None)
     loading_group.add_argument("--device", default="cuda")
+    loading_group.add_argument(
+        "--attn_implementation",
+        default="sdpa",
+        choices=["eager", "sdpa", "flash_attention_2"],
+    )
     loading_group.add_argument(
         "--bf16_dtype",
         default="bfloat16",
