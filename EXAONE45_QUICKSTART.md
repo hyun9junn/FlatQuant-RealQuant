@@ -81,7 +81,8 @@ python benchmarks/benchmark_exaone45.py ppl \
   --flatquant_labels FlatQuant-W4A4 FlatQuant-W4A16 \
   --datasets wikitext2 c4 \
   --seqlen 2048 \
-  --max_samples 100000
+  --max_samples 100000 \
+  --attn_implementation sdpa
 ```
 
 ## Compare Latency
@@ -97,22 +98,24 @@ python benchmarks/benchmark_exaone45.py latency \
   --prefill_seq_len 2048 \
   --decode_steps 256 \
   --warmup_steps 2 \
-  --num_repeats 10
+  --num_repeats 10 \
+  --attn_implementation sdpa
 ```
 
 ## Compare Text Eval
 
 ```bash
 python benchmarks/benchmark_exaone45.py eval \
-  --models bf16 awq flatquant \
+  --models awq flatquant \
   --awq_model_path /workspace/.hf_home/hub/models--LGAI-EXAONE--EXAONE-4.5-33B-AWQ/snapshots/d73d64aa670777f94f101916ea0803e033ba9b59 \
   --flatquant_model_paths ./outputs/EXAONE-4.5-33B/w4a4/exaone45-33b-w4a4-e15-lr5e3-ppl \
     ./outputs/EXAONE-4.5-33B/w4a16/exaone45-33b-w4a16-e15-lr5e3 \
   --flatquant_labels FlatQuant-W4A4 FlatQuant-W4A16 \
-  --tasks mmlu \
+  --tasks mmlu-pro \
   --num_fewshot 5 \
-  --limit 10 \
-  --batch_size 8
+  --batch_size 1 \
+  --max_length 4096 \
+  --attn_implementation sdpa
 ```
 
 ```bash
@@ -125,7 +128,9 @@ python benchmarks/benchmark_exaone45.py eval \
   --tasks mmlu_abstract_algebra \
   --num_fewshot 5 \
   --limit 10 \
-  --batch_size 16
+  --batch_size 1 \
+  --max_length 4096 \
+  --attn_implementation sdpa
 ```
 
 ## Compare VLM Eval
@@ -143,7 +148,8 @@ python benchmarks/benchmark_exaone45.py eval \
   --flatquant_labels FlatQuant-W4A4 FlatQuant-W4A16 \
   --tasks mmmu_val mmmu_pro mathvista_testmini mathvision_testmini wemath logicvista charxiv \
   --batch_size 1 \
-  --max_new_tokens 128
+  --max_new_tokens 128 \
+  --attn_implementation sdpa
 ```
 
 ## Profile Prefill
