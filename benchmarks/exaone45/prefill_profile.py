@@ -1,24 +1,41 @@
 import argparse
 import json
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
 import torch
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+try:
+    from benchmarks.exaone45 import common
+except ImportError:
+    import common
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from benchmark_exaone45_latency import (
-    DEFAULT_FLATQUANT_PATH,
-    _cleanup,
-    _forward,
-    _model_device,
-    _random_input,
-    _sync,
-    load_model,
-)
+try:
+    from benchmarks.exaone45.latency import (
+        DEFAULT_FLATQUANT_PATH,
+        _cleanup,
+        _forward,
+        _model_device,
+        _random_input,
+        _sync,
+        load_model,
+    )
+except ImportError:
+    from latency import (
+        DEFAULT_FLATQUANT_PATH,
+        _cleanup,
+        _forward,
+        _model_device,
+        _random_input,
+        _sync,
+        load_model,
+    )
 
 
 PROFILE_TYPES = {
@@ -271,8 +288,18 @@ def _print_table(title, rows, columns, limit):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Profile EXAONE-4.5 prefill bottlenecks.")
-    parser.add_argument("--model_path", default=DEFAULT_FLATQUANT_PATH)
-    parser.add_argument("--model_kind", default="auto", choices=["auto", "flatquant", "original"])
+    parser.add_argument("--model_path", default=DEFAULT_FLATQUANT_PATH, help="Single-model path for legacy one-off runs.")
+    parser.add_argument("--model_kind", default="auto", choices=common.MODEL_KIND_CHOICES)
+    parser.add_argument("--label", default=None)
+    parser.add_argument("--models", nargs="+", choices=common.MODEL_CHOICES, default=None)
+    parser.add_argument("--bf16_model_path", default=common.DEFAULT_BF16_MODEL)
+    parser.add_argument("--awq_model_path", default=None)
+    parser.add_argument("--flatquant_model_path", default=common.DEFAULT_FLATQUANT_MODEL)
+    parser.add_argument("--flatquant_model_paths", nargs="+", default=None)
+    parser.add_argument("--bf16_label", default="BF16")
+    parser.add_argument("--awq_label", default="AWQ")
+    parser.add_argument("--flatquant_label", default="FlatQuant")
+    parser.add_argument("--flatquant_labels", nargs="+", default=None)
     parser.add_argument(
         "--attn_implementation",
         default="sdpa",
@@ -282,7 +309,15 @@ def parse_args():
     parser.add_argument("--prefill_seq_len", type=int, default=2048)
     parser.add_argument("--warmup_steps", type=int, default=1)
     parser.add_argument("--logits_to_keep", type=int, default=1)
-    parser.add_argument("--dtype", default="bfloat16", help="Only used for original baseline models.")
+    parser.add_argument("--dtype", default="bfloat16", help="Single-model dtype.")
+    parser.add_argument("--bf16_dtype", default="bfloat16")
+    parser.add_argument("--awq_dtype", default="auto")
+    parser.add_argument("--flatquant_dtype", default="float16")
+    parser.add_argument("--flatquant_eval_mode", default="auto", choices=["auto", "deploy", "weight_only"])
+    parser.add_argument("--device_map", default=None)
+    parser.add_argument("--bf16_device_map", default=None)
+    parser.add_argument("--awq_device_map", default=None)
+    parser.add_argument("--flatquant_device_map", default=None)
     parser.add_argument("--hf_token", default=None)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--layers", nargs="*", default=None, help="Optional layer indices, e.g. --layers 0 31 63")
@@ -291,73 +326,124 @@ def parse_args():
     parser.add_argument("--skip_torch_profiler", action="store_true")
     parser.add_argument("--record_shapes", action="store_true")
     parser.add_argument("--output_path", default=None)
+    parser.add_argument("--output_dir", default=None)
     return parser.parse_args()
 
+
+def _run_profile_for_spec(args, spec, output_path=None, output_dir=None):
+    print(f"\n=== Profile: {spec.label} ===")
+    model = None
+    try:
+        print(f"Loading model: {spec.path}")
+        model, metadata = common.load_model_from_spec(
+            spec,
+            device=args.device,
+            hf_token=args.hf_token,
+            attn_implementation=args.attn_implementation,
+        )
+        device = _model_device(model)
+        input_ids = _random_input(model, args.batch_size, args.prefill_seq_len)
+
+        for _ in range(args.warmup_steps):
+            _forward(model, input_ids, logits_to_keep=args.logits_to_keep)
+        _sync(device)
+        _cleanup(device)
+
+        print(
+            f"Profiling label={spec.label}, model_kind={metadata['model_kind']}, "
+            f"attn={args.attn_implementation}, batch={args.batch_size}, prefill={args.prefill_seq_len}"
+        )
+        module_summary = _profile_modules(model, input_ids, args)
+        op_summary = _profile_ops(model, input_ids, args)
+
+        result = {
+            "label": spec.label,
+            "model_path": spec.path,
+            "model_kind": metadata["model_kind"],
+            "dtype": spec.dtype,
+            "attn_implementation": args.attn_implementation,
+            "batch_size": args.batch_size,
+            "prefill_seq_len": args.prefill_seq_len,
+            "layers": sorted(_parse_layers(args.layers) or []),
+            "module_profile": module_summary,
+            "op_profile": op_summary,
+        }
+        if metadata.get("flatquant_eval_mode") is not None:
+            result["flatquant_eval_mode"] = metadata["flatquant_eval_mode"]
+
+        if output_path is None:
+            if output_dir is not None:
+                output_path = Path(output_dir) / f"{common.safe_name(spec.label)}_profile.json"
+            else:
+                output_path = _default_output_path(
+                    spec.path,
+                    metadata["model_kind"],
+                    args.attn_implementation,
+                    args.batch_size,
+                    args.prefill_seq_len,
+                )
+        common.write_json(output_path, result)
+
+        _print_table(
+            "Module buckets by inclusive CUDA ms",
+            module_summary["by_bucket"],
+            ["bucket", "calls", "cuda_ms", "mean_cuda_ms"],
+            args.top_modules,
+        )
+        _print_table(
+            "Top individual modules by inclusive CUDA ms",
+            module_summary["by_module"],
+            ["name", "type", "calls", "cuda_ms", "mean_cuda_ms"],
+            args.top_modules,
+        )
+        _print_table(
+            "Top CUDA ops by self CUDA ms",
+            op_summary,
+            ["name", "calls", "self_cuda_ms", "cuda_ms"],
+            args.top_ops,
+        )
+        print(f"\nSaved profile to {output_path}")
+        return result
+    finally:
+        if model is not None:
+            del model
+        common.cleanup(args.device)
 
 def main():
     args = parse_args()
     args.device = torch.device(args.device)
-    model, model_kind = load_model(args)
-    device = _model_device(model)
-    input_ids = _random_input(model, args.batch_size, args.prefill_seq_len)
+    specs = common.build_model_specs(args, default_models=None)
+    multi_model = len(specs) > 1
+    output_dir = None
+    if multi_model or args.output_dir:
+        output_dir = Path(args.output_dir or Path("outputs/profile_results") / time.strftime("compare_%Y%m%d_%H%M%S"))
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    for _ in range(args.warmup_steps):
-        _forward(model, input_ids, logits_to_keep=args.logits_to_keep)
-    _sync(device)
-    _cleanup(device)
-
-    print(
-        f"Profiling model_kind={model_kind}, attn={args.attn_implementation}, "
-        f"batch={args.batch_size}, prefill={args.prefill_seq_len}"
-    )
-    module_summary = _profile_modules(model, input_ids, args)
-    op_summary = _profile_ops(model, input_ids, args)
-
-    result = {
-        "model_path": args.model_path,
-        "model_kind": model_kind,
-        "attn_implementation": args.attn_implementation,
-        "batch_size": args.batch_size,
-        "prefill_seq_len": args.prefill_seq_len,
-        "layers": sorted(_parse_layers(args.layers) or []),
-        "module_profile": module_summary,
-        "op_profile": op_summary,
-    }
-
-    output_path = (
-        Path(args.output_path)
-        if args.output_path
-        else _default_output_path(
-            args.model_path,
-            model_kind,
-            args.attn_implementation,
-            args.batch_size,
-            args.prefill_seq_len,
+    results = []
+    for spec in specs:
+        results.append(
+            _run_profile_for_spec(
+                args,
+                spec,
+                output_path=Path(args.output_path) if args.output_path and len(specs) == 1 else None,
+                output_dir=output_dir,
+            )
         )
-    )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2)
 
-    _print_table(
-        "Module buckets by inclusive CUDA ms",
-        module_summary["by_bucket"],
-        ["bucket", "calls", "cuda_ms", "mean_cuda_ms"],
-        args.top_modules,
-    )
-    _print_table(
-        "Top individual modules by inclusive CUDA ms",
-        module_summary["by_module"],
-        ["name", "type", "calls", "cuda_ms", "mean_cuda_ms"],
-        args.top_modules,
-    )
-    _print_table(
-        "Top CUDA ops by self CUDA ms",
-        op_summary,
-        ["name", "calls", "self_cuda_ms", "cuda_ms"],
-        args.top_ops,
-    )
-    print(f"\nSaved profile to {output_path}")
+    if len(results) > 1:
+        rows = []
+        for result in results:
+            op_total = sum(row.get("self_cuda_ms", 0.0) for row in result["op_profile"])
+            module_total = sum(row.get("cuda_ms", 0.0) for row in result["module_profile"]["by_bucket"])
+            rows.append(
+                {
+                    "model": result["label"],
+                    "top_op_self_cuda_ms": f"{op_total:.3f}",
+                    "profiled_module_cuda_ms": f"{module_total:.3f}",
+                }
+            )
+        common.print_comparison_table(rows, ["model", "top_op_self_cuda_ms", "profiled_module_cuda_ms"])
+        common.write_json(Path(output_dir) / "summary.json", {"models": results})
 
 
 if __name__ == "__main__":

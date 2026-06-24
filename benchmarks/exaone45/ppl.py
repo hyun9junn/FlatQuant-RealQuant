@@ -5,6 +5,10 @@ import time
 import types
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import numpy as np
 import torch
 import transformers
@@ -16,6 +20,10 @@ except ImportError:
 from tqdm import tqdm
 
 import flatquant.data_utils as data_utils
+try:
+    from benchmarks.exaone45 import common
+except ImportError:
+    import common
 from deploy.transformers.modeling_exaone4_5 import FlatQuantExaone45ForConditionalGeneration
 from transformers.models.exaone4_5.modeling_exaone4_5 import (
     Exaone4_5_ForConditionalGeneration,
@@ -428,79 +436,16 @@ def ppl_eval(model, testenc, seqlen=2048, max_samples=None, warmup=True):
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(description="PPL benchmark for FlatQuant or original EXAONE-4.5 checkpoints.")
-    parser.add_argument(
-        "--model_path",
-        default="./outputs/EXAONE-4.5-33B/w4a4/exaone45-33b-w4a4-e15-lr5e3-ppl",
-    )
-    parser.add_argument(
-        "--model_kind",
-        default="auto",
-        choices=["auto", "flatquant", "original"],
-        help="auto treats local FlatQuant checkpoints as flatquant and other paths as original.",
-    )
-    parser.add_argument("--tokenizer", default=None)
-    parser.add_argument("--hf_token", default=None)
-    parser.add_argument("--dataset", default="wikitext2", choices=["wikitext2", "c4"])
-    parser.add_argument("--seqlen", type=int, default=2048)
-    parser.add_argument("--max_samples", type=int, default=4)
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument(
-        "--flatquant_eval_mode",
-        default="auto",
-        choices=["auto", "deploy", "weight_only"],
-        help=(
-            "FlatQuant evaluation path. auto uses deploy for W4A4/KV4 checkpoints and "
-            "weight_only for W4A16-style checkpoints."
-        ),
-    )
-    parser.add_argument(
-        "--dtype",
-        default="float16",
-        choices=["auto", "float16", "fp16", "bfloat16", "bf16", "float32", "fp32"],
-        help="Model dtype for original baseline and FlatQuant weight_only loading. FlatQuant deploy uses float16.",
-    )
-    parser.add_argument("--no_warmup", action="store_true")
-    parser.add_argument("--output_path", default=None)
-    args = parser.parse_args()
-
-    model_kind = args.model_kind
-    if model_kind == "auto":
-        model_kind = "flatquant" if _is_flatquant_checkpoint(args.model_path) else "original"
-
-    tokenizer_name = args.tokenizer or _infer_tokenizer_name(args.model_path)
-    if tokenizer_name is None:
-        raise ValueError("Could not infer tokenizer. Pass --tokenizer explicitly.")
-
-    torch.set_grad_enabled(False)
-    torch.backends.cuda.matmul.allow_tf32 = True
-
-    print(f"Loading tokenizer: {tokenizer_name}")
-    tokenizer = _load_tokenizer(tokenizer_name, args.hf_token)
-    print(f"Loading {args.dataset} eval data")
+def _run_ppl_dataset(args, spec, model, metadata, tokenizer, tokenizer_name, dataset, output_path=None, output_dir=None):
+    print(f"\n--- PPL dataset: {dataset} ({spec.label}) ---")
+    print(f"Loading {dataset} eval data")
     testenc = data_utils.get_loaders(
         argparse.Namespace(),
-        args.dataset,
+        dataset,
         tokenizer,
         seqlen=args.seqlen,
         eval_mode=True,
     )
-
-    if model_kind == "flatquant":
-        flatquant_eval_mode = _resolve_flatquant_eval_mode(args.model_path, args.flatquant_eval_mode)
-        print(f"Loading FlatQuant checkpoint ({flatquant_eval_mode}): {args.model_path}")
-        model, flatquant_eval_mode = _load_flatquant_model(
-            args.model_path,
-            args.device,
-            args.dtype,
-            args.hf_token,
-            flatquant_eval_mode,
-        )
-    else:
-        flatquant_eval_mode = None
-        print(f"Loading original baseline model: {args.model_path}")
-        model = _load_original_model(args.model_path, args.device, args.dtype, args.hf_token)
 
     result = ppl_eval(
         model,
@@ -509,20 +454,171 @@ def main():
         max_samples=args.max_samples,
         warmup=not args.no_warmup,
     )
-    result.update({"dataset": args.dataset, "model_kind": model_kind, "model_path": args.model_path})
-    if flatquant_eval_mode is not None:
-        result["flatquant_eval_mode"] = flatquant_eval_mode
-    print(json.dumps(result, indent=2, sort_keys=True))
+    result.update(
+        {
+            "label": spec.label,
+            "dataset": dataset,
+            "model_kind": metadata["model_kind"],
+            "model_path": spec.path,
+            "dtype": spec.dtype,
+            "tokenizer": tokenizer_name,
+        }
+    )
+    if metadata.get("flatquant_eval_mode") is not None:
+        result["flatquant_eval_mode"] = metadata["flatquant_eval_mode"]
 
-    output_path = args.output_path
     if output_path is None:
-        output_path = _default_output_path(args.model_path, args.dataset, result["nsamples"])
-    else:
-        output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, sort_keys=True)
+        if output_dir is not None:
+            output_path = Path(output_dir) / f"{common.safe_name(spec.label)}_{dataset}_ppl.json"
+        else:
+            output_path = _default_output_path(spec.path, dataset, result["nsamples"])
+    common.write_json(output_path, result)
+    print(json.dumps(result, indent=2, sort_keys=True))
     print(f"Saved results to {output_path}")
+    return result
+
+
+def _run_ppl_for_spec(args, spec, datasets, output_path=None, output_dir=None):
+    tokenizer_name = spec.tokenizer or args.tokenizer or common.infer_tokenizer_name(spec.path)
+    if tokenizer_name is None:
+        raise ValueError(f"Could not infer tokenizer for {spec.label}. Pass --tokenizer or --{spec.key}_tokenizer.")
+
+    print(f"\n=== PPL: {spec.label} ===")
+    print(f"Loading tokenizer: {tokenizer_name}")
+    tokenizer = common.load_tokenizer(tokenizer_name, args.hf_token)
+
+    model = None
+    try:
+        print(f"Loading model: {spec.path}")
+        model, metadata = common.load_model_from_spec(
+            spec,
+            device=args.device,
+            hf_token=args.hf_token,
+            attn_implementation="eager",
+        )
+        print(f"Model ready: {spec.label}. Running datasets: {', '.join(datasets)}")
+
+        results = []
+        for dataset in datasets:
+            results.append(
+                _run_ppl_dataset(
+                    args,
+                    spec,
+                    model,
+                    metadata,
+                    tokenizer,
+                    tokenizer_name,
+                    dataset,
+                    output_path=output_path if len(datasets) == 1 else None,
+                    output_dir=output_dir,
+                )
+            )
+        return results
+    finally:
+        if model is not None:
+            del model
+        del tokenizer
+        common.cleanup(args.device)
+
+
+def _run_ppl_comparison(args):
+    specs = common.build_model_specs(args, default_models=None)
+    datasets = common.dedupe_preserve_order(common.flatten_values(getattr(args, "datasets", None)) or [args.dataset])
+    multi_run = len(specs) > 1 or len(datasets) > 1
+    output_dir = None
+    if multi_run or args.output_dir:
+        output_dir = Path(args.output_dir or Path("./outputs/ppl_results") / time.strftime("compare_%Y%m%d_%H%M%S"))
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    all_results = []
+    original_dataset = args.dataset
+    try:
+        for spec in specs:
+            spec_results = _run_ppl_for_spec(
+                args,
+                spec,
+                datasets,
+                output_path=Path(args.output_path) if args.output_path and len(specs) == 1 and len(datasets) == 1 else None,
+                output_dir=output_dir,
+            )
+            all_results.extend(spec_results)
+    finally:
+        args.dataset = original_dataset
+
+    if len(all_results) > 1:
+        rows = [
+            {
+                "dataset": result["dataset"],
+                "model": result["label"],
+                "ppl": f"{result['ppl']:.4f}",
+                "avg_time_ms": f"{result['avg_time_ms']:.2f}",
+                "nsamples": result["nsamples"],
+            }
+            for result in all_results
+        ]
+        common.print_comparison_table(rows, ["dataset", "model", "ppl", "avg_time_ms", "nsamples"])
+        common.write_json(Path(output_dir) / "summary.json", {"datasets": datasets, "models": all_results})
+
+def main():
+    parser = argparse.ArgumentParser(description="PPL benchmark for EXAONE-4.5 BF16/AWQ/FlatQuant checkpoints.")
+    parser.add_argument(
+        "--model_path",
+        default="./outputs/EXAONE-4.5-33B/w4a4/exaone45-33b-w4a4-e15-lr5e3-ppl",
+        help="Single-model path for legacy one-off runs.",
+    )
+    parser.add_argument(
+        "--model_kind",
+        default="auto",
+        choices=common.MODEL_KIND_CHOICES,
+        help="auto detects local FlatQuant/AWQ checkpoints; bf16 is treated as original.",
+    )
+    parser.add_argument("--label", default=None, help="Single-model result label.")
+    parser.add_argument("--models", nargs="+", choices=common.MODEL_CHOICES, default=None)
+    parser.add_argument("--bf16_model_path", default=common.DEFAULT_BF16_MODEL)
+    parser.add_argument("--awq_model_path", default=None)
+    parser.add_argument("--flatquant_model_path", default=common.DEFAULT_FLATQUANT_MODEL)
+    parser.add_argument("--flatquant_model_paths", nargs="+", default=None)
+    parser.add_argument("--bf16_label", default="BF16")
+    parser.add_argument("--awq_label", default="AWQ")
+    parser.add_argument("--flatquant_label", default="FlatQuant")
+    parser.add_argument("--flatquant_labels", nargs="+", default=None)
+    parser.add_argument("--tokenizer", default=None)
+    parser.add_argument("--bf16_tokenizer", default=None)
+    parser.add_argument("--awq_tokenizer", default=None)
+    parser.add_argument("--flatquant_tokenizer", default=None)
+    parser.add_argument("--hf_token", default=None)
+    parser.add_argument("--dataset", default="wikitext2", choices=["wikitext2", "c4"], help="Single dataset for legacy one-off runs.")
+    parser.add_argument("--datasets", nargs="+", choices=["wikitext2", "c4"], default=None, help="Run multiple PPL datasets in one invocation.")
+    parser.add_argument("--seqlen", type=int, default=2048)
+    parser.add_argument("--max_samples", type=int, default=4)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--flatquant_eval_mode",
+        default="auto",
+        choices=["auto", "deploy", "weight_only"],
+        help="FlatQuant path. auto uses deploy for W4A4/KV4 and weight_only for W4A16-style checkpoints.",
+    )
+    parser.add_argument(
+        "--dtype",
+        default="float16",
+        choices=["auto", "float16", "fp16", "bfloat16", "bf16", "float32", "fp32"],
+        help="Single-model dtype. FlatQuant deploy uses float16.",
+    )
+    parser.add_argument("--bf16_dtype", default="bfloat16")
+    parser.add_argument("--awq_dtype", default="auto")
+    parser.add_argument("--flatquant_dtype", default="float16")
+    parser.add_argument("--device_map", default=None)
+    parser.add_argument("--bf16_device_map", default=None)
+    parser.add_argument("--awq_device_map", default=None)
+    parser.add_argument("--flatquant_device_map", default=None)
+    parser.add_argument("--no_warmup", action="store_true")
+    parser.add_argument("--output_path", default=None)
+    parser.add_argument("--output_dir", default=None)
+    args = parser.parse_args()
+
+    torch.set_grad_enabled(False)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    _run_ppl_comparison(args)
 
 
 if __name__ == "__main__":

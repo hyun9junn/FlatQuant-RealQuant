@@ -8,6 +8,11 @@ import numpy as np
 import torch
 import transformers
 
+try:
+    from benchmarks.exaone45 import common
+except ImportError:
+    import common
+
 from deploy.transformers.modeling_exaone4_5 import FlatQuantExaone45ForConditionalGeneration
 from transformers.models.exaone4_5.modeling_exaone4_5 import (
     Exaone4_5_ForConditionalGeneration,
@@ -147,22 +152,22 @@ def _load_original_model(model_path, device, dtype, hf_token, attn_implementatio
     return model.eval().to(device=device)
 
 
-def load_model(args):
-    model_kind = args.model_kind
-    if model_kind == "auto":
-        model_kind = "flatquant" if _is_flatquant_checkpoint(args.model_path) else "original"
-
+def load_model_with_metadata(args):
+    spec = common.build_model_specs(args, default_models=None)[0]
     torch.set_grad_enabled(False)
     torch.backends.cuda.matmul.allow_tf32 = True
+    print(f"Loading {spec.label}: {spec.path}")
+    model, metadata = common.load_model_from_spec(
+        spec,
+        device=args.device,
+        hf_token=args.hf_token,
+        attn_implementation=args.attn_implementation,
+    )
+    return model, metadata["model_kind"], metadata, spec
 
-    if model_kind == "flatquant":
-        print(f"Loading FlatQuant checkpoint: {args.model_path}")
-        model = _load_flatquant_model(args.model_path, args.device, args.attn_implementation)
-    else:
-        print(f"Loading original baseline model: {args.model_path}")
-        model = _load_original_model(
-            args.model_path, args.device, args.dtype, args.hf_token, args.attn_implementation
-        )
+
+def load_model(args):
+    model, model_kind, _, _ = load_model_with_metadata(args)
     return model, model_kind
 
 
@@ -386,19 +391,132 @@ def _default_output_path(model_path, model_kind, batch_size, prefill_seq_len, de
     )
 
 
+def _run_latency_for_spec(args, spec, output_path=None, output_dir=None):
+    print(f"\n=== Latency: {spec.label} ===")
+    model = None
+    try:
+        print(f"Loading model: {spec.path}")
+        model, metadata = common.load_model_from_spec(
+            spec,
+            device=args.device,
+            hf_token=args.hf_token,
+            attn_implementation=args.attn_implementation,
+        )
+        print(f"Model ready: {spec.label}. Running stages: {', '.join(args.stages)}")
+        result = run_latency_benchmark(model, args)
+        result.update(
+            {
+                "label": spec.label,
+                "model_path": spec.path,
+                "model_kind": metadata["model_kind"],
+                "batch_size": args.batch_size,
+                "prefill_seq_len": args.prefill_seq_len,
+                "decode_steps": args.decode_steps,
+                "warmup_steps": args.warmup_steps,
+                "stages": args.stages,
+                "bench_steps": args.bench_steps,
+                "num_repeats": args.num_repeats,
+                "logits_to_keep": args.logits_to_keep,
+                "dtype": spec.dtype,
+                "attn_implementation": args.attn_implementation,
+            }
+        )
+        if metadata.get("flatquant_eval_mode") is not None:
+            result["flatquant_eval_mode"] = metadata["flatquant_eval_mode"]
+
+        print_summary(result)
+        print(json.dumps(result, indent=2, sort_keys=True))
+
+        if output_path is None:
+            if output_dir is not None:
+                output_path = Path(output_dir) / f"{common.safe_name(spec.label)}_latency.json"
+            else:
+                output_path = _default_output_path(
+                    spec.path,
+                    metadata["model_kind"],
+                    args.batch_size,
+                    args.prefill_seq_len,
+                    args.decode_steps,
+                    args.attn_implementation,
+                )
+        common.write_json(output_path, result)
+        print(f"Saved results to {output_path}")
+        return result
+    finally:
+        if model is not None:
+            del model
+        common.cleanup(args.device)
+
+def _latency_summary_row(result):
+    row = {"model": result["label"]}
+    if "prefill" in result:
+        row["prefill_tok_s"] = f"{result['prefill']['tokens_per_s']:.1f}"
+    if "decode" in result:
+        row["decode_ms_step"] = f"{result['decode']['ms_per_decode_step']:.3f}"
+        row["decode_tok_s"] = f"{result['decode']['tokens_per_s']:.1f}"
+    if "e2e" in result:
+        row["e2e_ms"] = f"{result['e2e']['mean_ms']:.2f}"
+    peak = max(
+        (stage.get("peak_memory_gb") or 0.0 for key, stage in result.items() if isinstance(stage, dict)),
+        default=0.0,
+    )
+    row["peak_gb"] = "" if peak == 0.0 else f"{peak:.2f}"
+    return row
+
+
+def _run_latency_comparison(args):
+    specs = common.build_model_specs(args, default_models=None)
+    multi_model = len(specs) > 1
+    output_dir = None
+    if multi_model or args.output_dir:
+        output_dir = Path(args.output_dir or Path("./outputs/latency_results") / time.strftime("compare_%Y%m%d_%H%M%S"))
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    results = []
+    for spec in specs:
+        results.append(
+            _run_latency_for_spec(
+                args,
+                spec,
+                output_path=Path(args.output_path) if args.output_path and len(specs) == 1 else None,
+                output_dir=output_dir,
+            )
+        )
+
+    if len(results) > 1:
+        rows = [_latency_summary_row(result) for result in results]
+        columns = ["model", "prefill_tok_s", "decode_ms_step", "decode_tok_s", "e2e_ms", "peak_gb"]
+        common.print_comparison_table(rows, columns)
+        common.write_json(Path(output_dir) / "summary.json", {"models": results})
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Prefill/decode latency benchmark for FlatQuant or original EXAONE-4.5."
+        description="Prefill/decode latency benchmark for EXAONE-4.5 BF16/AWQ/FlatQuant."
     )
-    parser.add_argument("--model_path", default=DEFAULT_FLATQUANT_PATH)
+    parser.add_argument("--model_path", default=DEFAULT_FLATQUANT_PATH, help="Single-model path for legacy one-off runs.")
     parser.add_argument(
         "--model_kind",
         default="auto",
-        choices=["auto", "flatquant", "original"],
-        help="auto treats local FlatQuant checkpoints as flatquant and other paths as original.",
+        choices=common.MODEL_KIND_CHOICES,
+        help="auto detects local FlatQuant/AWQ checkpoints; bf16 is treated as original.",
     )
+    parser.add_argument("--label", default=None, help="Single-model result label.")
+    parser.add_argument("--models", nargs="+", choices=common.MODEL_CHOICES, default=None)
+    parser.add_argument("--bf16_model_path", default=common.DEFAULT_BF16_MODEL)
+    parser.add_argument("--awq_model_path", default=None)
+    parser.add_argument("--flatquant_model_path", default=common.DEFAULT_FLATQUANT_MODEL)
+    parser.add_argument("--flatquant_model_paths", nargs="+", default=None)
+    parser.add_argument("--bf16_label", default="BF16")
+    parser.add_argument("--awq_label", default="AWQ")
+    parser.add_argument("--flatquant_label", default="FlatQuant")
+    parser.add_argument("--flatquant_labels", nargs="+", default=None)
     parser.add_argument("--hf_token", default=None)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device_map", default=None)
+    parser.add_argument("--bf16_device_map", default=None)
+    parser.add_argument("--awq_device_map", default=None)
+    parser.add_argument("--flatquant_device_map", default=None)
     parser.add_argument(
         "--attn_implementation",
         default="eager",
@@ -409,8 +527,12 @@ def main():
         "--dtype",
         default="float16",
         choices=["auto", "float16", "fp16", "bfloat16", "bf16", "float32", "fp32"],
-        help="Model dtype for original baseline loading. FlatQuant deploy uses float16.",
+        help="Single-model dtype. FlatQuant deploy uses float16.",
     )
+    parser.add_argument("--bf16_dtype", default="bfloat16")
+    parser.add_argument("--awq_dtype", default="auto")
+    parser.add_argument("--flatquant_dtype", default="float16")
+    parser.add_argument("--flatquant_eval_mode", default="auto", choices=["auto", "deploy", "weight_only"])
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--prefill_seq_len", type=int, default=2048)
     parser.add_argument("--decode_steps", type=int, default=256)
@@ -431,46 +553,10 @@ def main():
         help="Use 1 for generation-style latency. Use 0 to materialize full logits.",
     )
     parser.add_argument("--output_path", default=None)
+    parser.add_argument("--output_dir", default=None)
     args = parser.parse_args()
 
-    model, model_kind = load_model(args)
-    result = run_latency_benchmark(model, args)
-    result.update(
-        {
-            "model_path": args.model_path,
-            "model_kind": model_kind,
-            "batch_size": args.batch_size,
-            "prefill_seq_len": args.prefill_seq_len,
-            "decode_steps": args.decode_steps,
-            "warmup_steps": args.warmup_steps,
-            "stages": args.stages,
-            "bench_steps": args.bench_steps,
-            "num_repeats": args.num_repeats,
-            "logits_to_keep": args.logits_to_keep,
-            "dtype": args.dtype if model_kind == "original" else "float16",
-            "attn_implementation": args.attn_implementation,
-        }
-    )
-
-    print_summary(result)
-    print(json.dumps(result, indent=2, sort_keys=True))
-
-    output_path = (
-        Path(args.output_path)
-        if args.output_path
-        else _default_output_path(
-            args.model_path,
-            model_kind,
-            args.batch_size,
-            args.prefill_seq_len,
-            args.decode_steps,
-            args.attn_implementation,
-        )
-    )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, sort_keys=True)
-    print(f"Saved results to {output_path}")
+    _run_latency_comparison(args)
 
 
 if __name__ == "__main__":
