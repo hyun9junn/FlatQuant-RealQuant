@@ -10,6 +10,7 @@ from flatquant.trans_utils import SVDDecomposeTransMatrix, SVDSingleTransMatrix
 from flatquant.utils import skip_initialization
 
 from transformers.models.exaone4_5.modeling_exaone4_5 import (
+    ALL_ATTENTION_FUNCTIONS,
     apply_rotary_pos_emb,
     eager_attention_forward,
 )
@@ -215,7 +216,14 @@ class FlatQuantExaone45Attention(nn.Module):
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
 
-        attn_output, attn_weights = eager_attention_forward(
+        # Dispatch to the configured attention backend (eager/sdpa/flash) just
+        # like the deploy modeling does. The hardcoded eager path used to silently
+        # break under sdpa: create_causal_mask returns None for sdpa, and the eager
+        # kernel then skips masking entirely, producing non-causal attention.
+        attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, eager_attention_forward
+        )
+        attn_output, attn_weights = attention_interface(
             self,
             query_states,
             key_states,
