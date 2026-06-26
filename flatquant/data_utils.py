@@ -110,3 +110,71 @@ def get_loaders(
         dataset = dataset.input_ids
         dataset = TokenizerWrapper(dataset)
     return dataset
+
+
+def _find_image_column(dataset):
+    """Return the name of the column that holds PIL images (or image dicts)."""
+    from PIL.Image import Image as PILImage
+
+    features = getattr(dataset, "features", {}) or {}
+    for name in ("image", "img", "images", "jpg", "png"):
+        if name in features:
+            return name
+    # Fall back to probing the first row for a PIL image.
+    first = dataset[0]
+    for key, value in first.items():
+        if isinstance(value, PILImage):
+            return key
+    raise ValueError("Could not locate an image column in the vision calibration dataset.")
+
+
+def _extract_image(example, column):
+    image = example[column]
+    if isinstance(image, dict) and "bytes" in image:
+        import io
+        from PIL import Image
+        image = Image.open(io.BytesIO(image["bytes"]))
+    return image.convert("RGB")
+
+
+def get_vision_calib_loader(dataset_name, processor, nsamples=128, seed=42):
+    """Yield ``(pixel_values, image_grid_thw)`` tensors for vision FlatQuant calibration.
+
+    Images are pulled from a HuggingFace dataset and run through the model's own image
+    processor so the patch layout (and therefore ``grid_thw``) matches inference. Only
+    the image branch of the processor is used -- no text/tokenizer is required.
+    """
+    image_processor = getattr(processor, "image_processor", processor)
+
+    dataset = None
+    last_err = None
+    for split in ("train", "validation", "test"):
+        try:
+            dataset = datasets.load_dataset(dataset_name, split=split)
+            break
+        except Exception as err:  # split may not exist; try the next one
+            last_err = err
+    if dataset is None:
+        raise RuntimeError(f"Could not load vision calibration dataset {dataset_name}: {last_err}")
+
+    column = _find_image_column(dataset)
+    indices = list(range(len(dataset)))
+    random.Random(seed).shuffle(indices)
+
+    samples = []
+    for idx in indices:
+        if len(samples) >= nsamples:
+            break
+        try:
+            image = _extract_image(dataset[idx], column)
+        except Exception:
+            continue
+        processed = image_processor(images=image, return_tensors="pt")
+        pixel_values = processed["pixel_values"]
+        grid_thw = processed.get("image_grid_thw")
+        if grid_thw is None:
+            continue
+        samples.append((pixel_values, grid_thw))
+    if not samples:
+        raise RuntimeError(f"No usable calibration images found in {dataset_name}.")
+    return samples

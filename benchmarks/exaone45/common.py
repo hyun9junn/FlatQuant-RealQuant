@@ -403,6 +403,19 @@ def _fuse_weight_only_marlin_projections(model, device):
     return fused_counts
 
 
+def _replace_vision_linears(model, linear_cls):
+    """Swap the vision encoder's plain ``nn.Linear`` layers for packed W4A16 ones.
+
+    Vision linears are quantized with RTN only (no FlatQuant transforms), so unlike
+    the text path they are never wrapped in ``FlatQuantizedLinear`` -- the bare
+    ``nn.Linear`` modules are replaced directly. Delegates to the shared deploy helper
+    so the weight-only and W4A4 deploy runtimes stay in lockstep.
+    """
+    from deploy.transformers.vision_quant import replace_vision_linears
+
+    return replace_vision_linears(model, linear_cls)
+
+
 def _is_runtime_state_key(key):
     if key.startswith("quantizer."):
         return False
@@ -454,9 +467,23 @@ def load_flatquant_weight_only_model(model_path, device, dtype, hf_token=None, a
         model = model_cls(config)
     torch.set_default_dtype(dtype_old)
 
-    model = apply_flatquant_to_exaone45(_flatquant_args_from_config(quant_config), model)
+    flatquant_args = _flatquant_args_from_config(quant_config)
+    model = apply_flatquant_to_exaone45(flatquant_args, model)
+    # Vision FlatQuant reuses the text eval machinery: wrapping the vision blocks here
+    # means _prepare_flatquant_eval_modules folds their transforms to eval mode and
+    # _replace_weight_only_linears swaps the inner .linear for packed kernels, exactly
+    # as for the text decoder. The learned transform matrices are then streamed in
+    # alongside the packed weights below.
+    vision_flatquant = quant_config.get("vision_flatquant", False)
+    if vision_flatquant:
+        from flatquant.model_tools.exaone45_vision_utils import apply_flatquant_to_exaone45_vision
+
+        apply_flatquant_to_exaone45_vision(flatquant_args, model)
     _prepare_flatquant_eval_modules(model)
     replaced_linears = _replace_weight_only_linears(model, linear_cls)
+    if quant_config.get("quantize_vision", False) and not vision_flatquant:
+        # RTN-only vision (no transforms): replace the bare nn.Linear layers directly.
+        replaced_linears += _replace_vision_linears(model, linear_cls)
     if hasattr(model, "generation_config"):
         model.generation_config.cache_implementation = None
 
@@ -478,7 +505,11 @@ def load_flatquant_weight_only_model(model_path, device, dtype, hf_token=None, a
                     continue
 
                 tensor = f.get_tensor(key).cpu()
-                if key.endswith(".linear.weight") and tensor.dtype == torch.uint8:
+                # Packed int4 weights are stored as uint8. Text linears live under
+                # ``.linear.weight`` (FlatQuant-wrapped); vision linears are bare
+                # ``.weight``. Both land on a packed linear_cls module after the
+                # replacements above, so detect them by dtype rather than by suffix.
+                if key.endswith(".weight") and tensor.dtype == torch.uint8:
                     scale = scales.get(_quantizer_scale_key(key))
                     if scale is None:
                         skipped_packed.append(key)

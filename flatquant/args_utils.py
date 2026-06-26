@@ -142,11 +142,28 @@ def parser_gen():
     parser.add_argument('--quantized_save', action = "store_true", default = False,
                         help = 'Save the quantized model checkpoint.')
 
+    # Also weight-quantize the vision encoder (ViT blocks + patch merger) when the
+    # model is multimodal. Without this, only the text decoder is quantized and the
+    # vision tower stays in fp16.
+    parser.add_argument('--quantize_vision', action="store_true", default=False,
+                        help='Apply RTN weight quantization to the vision encoder linears too.')
+    # Learn FlatQuant transforms for the vision encoder (implies --quantize_vision).
+    # Requires image calibration data (--cali_dataset_vision).
+    parser.add_argument('--vision_flatquant', action="store_true", default=False,
+                        help='Learn FlatQuant transforms for the vision encoder before quantizing it.')
+    parser.add_argument('--cali_dataset_vision', type=str, default="lmms-lab/COCO-Caption2017-test",
+                        help='HuggingFace image dataset used to calibrate the vision encoder.')
+    parser.add_argument('--nsamples_vision', type=int, default=128,
+                        help='Number of calibration images for vision FlatQuant.')
+
     args = parser.parse_args()
     if args.a_groupsize > -1:
         raise NotImplementedError
     
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    # Vision FlatQuant requires the vision linears to actually be quantized.
+    if args.vision_flatquant:
+        args.quantize_vision = True
     args.quantize = (args.w_bits < 16) or (args.a_bits < 16) or (args.q_bits < 16) or (args.k_bits < 16) or (args.v_bits < 16)
     # # cache path
     # args.cache_dir = os.path.join(args.output_dir, ".cache")

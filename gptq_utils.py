@@ -7,7 +7,12 @@ import logging
 
 from flatquant.utils import cleanup_memory
 from flatquant.quant_utils import WeightQuantizer
-from flatquant.model_tools.model_access import get_transformer_layer_prefix, get_transformer_layers, is_exaone45_model
+from flatquant.model_tools.model_access import (
+    get_transformer_layer_prefix,
+    get_transformer_layers,
+    get_vision_module,
+    is_exaone45_model,
+)
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -310,6 +315,43 @@ def rtn_fwrd(model, dev, args):
         layers[i] = layer.cpu()
         torch.cuda.empty_cache()
         del layer
-            
+
+    if getattr(args, "quantize_vision", False):
+        rtn_quantize_vision(model, dev, args, quantizers)
+
     cleanup_memory(verbose=True)
+    return quantizers
+
+
+@torch.no_grad()
+def rtn_quantize_vision(model, dev, args, quantizers):
+    '''RTN weight quantization for the vision encoder (ViT blocks + patch merger).
+
+    The vision tower is much smaller than the text decoder, so unlike the text
+    path we quantize it in a single sweep. Keys are written with the same prefix
+    as ``model.named_parameters()`` (e.g. ``model.visual.blocks.0.attn.qkv``) so
+    the existing safetensors saver packs them automatically. Only ``nn.Linear``
+    layers are quantized; the patch_embed Conv3d stays in fp16.
+    '''
+    visual = get_vision_module(model)
+    if visual is None:
+        logging.warning("--quantize_vision set but model has no vision encoder; skipping.")
+        return quantizers
+
+    visual = visual.to(dev)
+    subset = find_qlayers(visual, layers=[torch.nn.Linear])
+    for name in tqdm.tqdm(subset, desc="(RtN Quant.) Vision"):
+        if args.w_bits >= 16:
+            continue
+        quantizer = WeightQuantizer()
+        quantizer.configure(
+            args.w_bits, perchannel=True, sym=not(args.w_asym), mse=args.gptq_mse
+        )
+        W = subset[name].weight.data
+        w_dtype = W.dtype
+        quantizer.find_params(W)
+        subset[name].weight.data = quantizer.quantize(W).to(w_dtype)
+        quantizers[f'model.visual.{name}'] = quantizer.cpu()
+    visual.cpu()
+    torch.cuda.empty_cache()
     return quantizers

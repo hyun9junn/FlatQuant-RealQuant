@@ -71,6 +71,50 @@ python main.py \
   --exp_name exaone45-33b-w4a16-e15-lr5e3
 ```
 
+### Also quantize the vision encoder
+
+By default only the text decoder is quantized; the ViT vision tower stays in fp16.
+Add `--quantize_vision` to additionally RTN-quantize the vision encoder linears
+(ViT blocks + patch merger) to int4. The flag is recorded in
+`quantization_config.json` (`"quantize_vision": true`), and the W4A16 runtime
+(`benchmarks/exaone45/common.py`) then loads/runs the packed vision linears too.
+
+```bash
+python main.py \
+  --model LGAI-EXAONE/EXAONE-4.5-33B \
+  --quantize \
+  --w_bits 4 --a_bits 16 --q_bits 16 --k_bits 16 --v_bits 16 \
+  --lwc --cali_trans \
+  --nsamples 128 --cali_bsz 1 --epochs 15 \
+  --flat_lr 5e-3 \
+  --quantized_save --quantize_vision \
+  --skip_ppl_eval \
+  --output_dir ./outputs \
+  --exp_name exaone45-33b-w4a16-e15-lr5e3-vis
+```
+
+`--quantize_vision` alone uses **RTN weight-only** on the vision linears (no learned
+transforms, no image calibration). To instead learn **FlatQuant transforms** for the
+vision encoder, add `--vision_flatquant` (it implies `--quantize_vision`) and point
+`--cali_dataset_vision` at a HuggingFace image dataset. This wraps the ViT blocks +
+patch merger, calibrates their transforms on real images, folds them in, then RTN-
+quantizes the flattened weights. The W4A16 runtime auto-applies the saved vision
+transforms (config flag `vision_flatquant: true`).
+
+```bash
+python main.py \
+  --model LGAI-EXAONE/EXAONE-4.5-33B \
+  --quantize \
+  --w_bits 4 --a_bits 16 --q_bits 16 --k_bits 16 --v_bits 16 \
+  --lwc --cali_trans \
+  --nsamples 128 --cali_bsz 1 --epochs 15 --flat_lr 5e-3 \
+  --vision_flatquant \
+  --cali_dataset_vision lmms-lab/COCO-Caption2017-test --nsamples_vision 128 \
+  --quantized_save --skip_ppl_eval \
+  --output_dir ./outputs \
+  --exp_name exaone45-33b-w4a16-e15-lr5e3-visfq
+```
+
 ## Compare PPL
 
 ```bash
@@ -146,7 +190,7 @@ uv pip install git+https://github.com/EvolvingLMMs-Lab/lmms-eval.git
 
 ```bash
 python benchmarks/benchmark_exaone45.py eval \
-  --models bf16 awq flatquant \
+  --models awq flatquant \
   --awq_model_path /workspace/.hf_home/hub/models--LGAI-EXAONE--EXAONE-4.5-33B-AWQ/snapshots/d73d64aa670777f94f101916ea0803e033ba9b59 \
   --flatquant_model_paths ./outputs/EXAONE-4.5-33B/w4a4/exaone45-33b-w4a4-e15-lr5e3-ppl \
     ./outputs/EXAONE-4.5-33B/w4a16/exaone45-33b-w4a16-e15-lr5e3 \
@@ -154,6 +198,7 @@ python benchmarks/benchmark_exaone45.py eval \
   --flatquant_dtype bfloat16 \
   --tasks mmmu_val mmmu_pro mathvista_testmini mathvision_testmini wemath logicvista charxiv \
   --batch_size 1 \
+  --limit 10 \
   --max_new_tokens 128 \
   --attn_implementation sdpa
 ```

@@ -220,12 +220,64 @@ class FlatQuantExaone45ForConditionalGeneration(Exaone4_5_ForConditionalGenerati
         torch.set_default_dtype(dtype_old)
 
         state_dict = _load_safetensors_state_dict(pretrained_model_name)
-        model_state_dict, quantizer_state_dict = _convert_flatquant_state_dict(state_dict)
+
+        # The vision tower is weight-only int4. Its packed weights and (for
+        # vision_flatquant) its transform matrices are loaded by a dedicated loader --
+        # the text-centric key remapping in _convert_flatquant_state_dict would mangle
+        # vision transform names, so vision keys are split off before conversion.
+        quantize_vision = quant_config.get("quantize_vision", False)
+        vision_flatquant = quant_config.get("vision_flatquant", False)
+        if quantize_vision:
+            from deploy.transformers import vision_quant
+
+            if not torch.cuda.is_available():
+                raise NotImplementedError("quantize_vision deploy inference requires CUDA.")
+            vision_device = "cuda"
+            text_state = {
+                k: v for k, v in state_dict.items()
+                if not (k.startswith("model.visual") or k.startswith("quantizer.model.visual"))
+            }
+        else:
+            text_state = state_dict
+        model_state_dict, quantizer_state_dict = _convert_flatquant_state_dict(text_state)
+
+        vision_linear_cls = None
+        if quantize_vision and not vision_flatquant:
+            # RTN-only vision: swap the bare linears now so load_state_dict skips them.
+            vision_linear_cls = vision_quant.select_vision_linear_cls(vision_device, prefer_marlin=True)
+            vision_quant.replace_vision_linears(model, vision_linear_cls)
+
         model.load_state_dict(model_state_dict, strict=False)
         model.load_state_dict(quantizer_state_dict, strict=False)
         _share_loaded_transforms(model)
         _convert_clip_buffers_to_scalars(model)
+
+        if quantize_vision:
+            if vision_flatquant:
+                vision_quant.load_vision_flatquant(
+                    model, pretrained_model_name, _vision_flatquant_args(quant_config), vision_device
+                )
+            else:
+                vision_quant.get_vision_module(model).to(vision_device)
+                vision_quant.load_vision_packed_weights(
+                    model, pretrained_model_name, vision_linear_cls, device=vision_device
+                )
         return model
+
+
+def _vision_flatquant_args(quant_config):
+    """Build the minimal args namespace the vision FlatQuant wrappers expect."""
+    return SimpleNamespace(
+        w_bits=int(quant_config.get("w_bits", 4)),
+        a_bits=int(quant_config.get("a_bits", 16)),
+        w_asym=not quant_config.get("symmetric", True),
+        a_asym=False,
+        lac=False,
+        a_groupsize=-1,
+        lwc=False,
+        direct_inv=False,
+        cali_trans=True,
+    )
 
 
 def _normalize_exaone45_config_dict(config_dict):

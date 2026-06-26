@@ -40,6 +40,8 @@ def _flatquant_quantization_config(args, sym, is_sharded):
         "format": "packed_int4",
         "sharded": is_sharded,
         "real_runtime": "flatquant",
+        "quantize_vision": bool(getattr(args, "quantize_vision", False)),
+        "vision_flatquant": bool(getattr(args, "vision_flatquant", False)),
     }
     for name, default in (
         ("fuseLN", False),

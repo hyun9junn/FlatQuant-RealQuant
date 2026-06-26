@@ -41,6 +41,21 @@ def is_exaone45_model(model):
     return model_type == "exaone4_5"
 
 
+def get_vision_module(model):
+    """Return the vision encoder (tower + merger) if the model has one, else None.
+
+    EXAONE-4.5 wraps its ViT under ``model.model.visual``; other layouts expose it
+    directly as ``model.visual``. The vision tower is optional, so callers should
+    treat ``None`` as "text-only model, nothing to quantize here".
+    """
+    inner = getattr(model, "model", None)
+    if inner is not None and hasattr(inner, "visual"):
+        return inner.visual
+    if hasattr(model, "visual"):
+        return model.visual
+    return None
+
+
 def first_hidden_state(output):
     if isinstance(output, (tuple, list)):
         return output[0]
