@@ -47,8 +47,11 @@ TASK_ALIASES = {
     "mathvision": "mathvision_testmini",
     "mathvision-mini": "mathvision_testmini",
     "mathvision_testmini": "mathvision_testmini",
-    "wemath": "wemath",
-    "logicvista": "logicvista",
+    "wemath": "wemath_testmini_reasoning",
+    "wemath_testmini": "wemath_testmini_reasoning",
+    "wemath_testmini_reasoning": "wemath_testmini_reasoning",
+    "logicvista": "logicvista_reasoning",
+    "logicvista_reasoning": "logicvista_reasoning",
     "charxiv": "charxiv",
     "charxiv-rq": "charxiv",
 }
@@ -273,7 +276,37 @@ def _require_lmms_eval():
         GenerationResult = None
         TokenCounts = None
 
+    _patch_lmms_eval_yaml_includes(lmms_utils)
     return evaluator, lmms_utils, lmms, TaskManager, GenerationResult, TokenCounts
+
+
+def _patch_lmms_eval_yaml_includes(lmms_utils) -> None:
+    if getattr(lmms_utils.load_yaml_config, "_flatquant_include_patch", False):
+        return
+
+    original_load_yaml_config = lmms_utils.load_yaml_config
+
+    def load_yaml_config_with_suffix_fallback(yaml_path=None, *args, **kwargs):
+        try:
+            return original_load_yaml_config(yaml_path=yaml_path, *args, **kwargs)
+        except FileNotFoundError:
+            if yaml_path is not None:
+                yaml_path_str = os.fspath(yaml_path)
+                if not yaml_path_str.endswith((".yaml", ".yml")):
+                    yaml_path_with_suffix = f"{yaml_path_str}.yaml"
+                    if os.path.isfile(yaml_path_with_suffix):
+                        return original_load_yaml_config(
+                            yaml_path=yaml_path_with_suffix,
+                            *args,
+                            **kwargs,
+                        )
+                    yaml_name = Path(yaml_path_str).name
+                    if yaml_name.startswith("_") or "_template_yaml" in yaml_name:
+                        return {}
+            raise
+
+    load_yaml_config_with_suffix_fallback._flatquant_include_patch = True
+    lmms_utils.load_yaml_config = load_yaml_config_with_suffix_fallback
 
 
 def _build_exaone_lmms_class(lmms_base, GenerationResult, TokenCounts):
@@ -576,6 +609,9 @@ def _build_exaone_lmms_class(lmms_base, GenerationResult, TokenCounts):
                 else:
                     results.append(answer)
             return results
+
+        def generate_until_multi_round(self, requests):
+            return self.generate_until(requests)
 
     return Exaone45LMM
 
