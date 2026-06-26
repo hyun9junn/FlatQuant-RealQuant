@@ -162,7 +162,9 @@ class LinearW4A16Marlin(nn.Module):
 
         output_dtype = self.output_dtype or x.dtype
         output_shape = x.shape[:-1] + (self.out_features,)
-        x = x.reshape(-1, self.in_features).to(torch.float16)
+        x = x.reshape(-1, self.in_features)
+        if x.dtype != torch.float16:
+            x = x.to(torch.float16)
         output = torch.empty(
             (x.shape[0], self.out_features),
             dtype=torch.float16,
@@ -181,7 +183,10 @@ class LinearW4A16Marlin(nn.Module):
         )
         if self.bias is not None:
             output = output + self.bias.to(output.dtype)
-        return output.reshape(output_shape).to(output_dtype)
+        output = output.reshape(output_shape)
+        if output.dtype != output_dtype:
+            output = output.to(output_dtype)
+        return output
 
     def extra_repr(self):
         return (

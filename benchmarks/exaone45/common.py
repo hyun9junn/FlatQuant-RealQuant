@@ -1,6 +1,7 @@
 import gc
 import importlib.util
 import json
+import os
 import sys
 import types
 from dataclasses import dataclass
@@ -345,6 +346,63 @@ def _replace_weight_only_linears(model, linear_cls):
     return replaced
 
 
+def _concat_marlin_linears(linears, device):
+    if not linears or not all(isinstance(linear, LinearW4A16Marlin) for linear in linears):
+        return None
+    in_features = linears[0].in_features
+    output_dtype = linears[0].output_dtype
+    if any(linear.in_features != in_features or linear.output_dtype != output_dtype for linear in linears):
+        return None
+    if any(linear.bias is not None for linear in linears):
+        return None
+
+    fused = LinearW4A16Marlin(
+        in_features,
+        sum(linear.out_features for linear in linears),
+        bias=False,
+        output_dtype=output_dtype,
+    )
+    fused.weight = torch.cat([linear.weight for linear in linears], dim=1).contiguous()
+    fused.weight_scales = torch.cat([linear.weight_scales for linear in linears], dim=1).contiguous()
+    fused.workspace = fused.workspace.to(device=device)
+    return fused
+
+
+def _fuse_weight_only_marlin_projections(model, device):
+    if os.environ.get("FLATQUANT_FUSE_MARLIN_PROJECTIONS", "0").lower() not in {"1", "true", "yes", "on"}:
+        return {"qkv": 0, "up_gate": 0}
+    if not is_marlin_available():
+        return {"qkv": 0, "up_gate": 0}
+
+    fused_counts = {"qkv": 0, "up_gate": 0}
+    language_model = getattr(getattr(model, "model", None), "language_model", None)
+    layers = getattr(language_model, "layers", None)
+    if layers is None:
+        return fused_counts
+
+    for layer in layers:
+        attn = getattr(layer, "self_attn", None)
+        if attn is not None:
+            q_proj = getattr(getattr(attn, "q_proj", None), "linear", None)
+            k_proj = getattr(getattr(attn, "k_proj", None), "linear", None)
+            v_proj = getattr(getattr(attn, "v_proj", None), "linear", None)
+            fused_qkv = _concat_marlin_linears([q_proj, k_proj, v_proj], device)
+            if fused_qkv is not None:
+                attn.fused_qkv_proj = fused_qkv
+                fused_counts["qkv"] += 1
+
+        mlp = getattr(layer, "mlp", None)
+        if mlp is not None:
+            gate_proj = getattr(getattr(mlp, "gate_proj", None), "linear", None)
+            up_proj = getattr(getattr(mlp, "up_proj", None), "linear", None)
+            fused_up_gate = _concat_marlin_linears([gate_proj, up_proj], device)
+            if fused_up_gate is not None:
+                mlp.fused_up_gate_proj = fused_up_gate
+                fused_counts["up_gate"] += 1
+
+    return fused_counts
+
+
 def _is_runtime_state_key(key):
     if key.startswith("quantizer."):
         return False
@@ -458,9 +516,18 @@ def load_flatquant_weight_only_model(model_path, device, dtype, hf_token=None, a
             if isinstance(module, LinearW4A16Marlin):
                 module.weight_scales = module.weight_scales.to(dtype=kernel_dtype)
 
+    fused_counts = _fuse_weight_only_marlin_projections(model, device) if linear_cls is LinearW4A16Marlin else {"qkv": 0, "up_gate": 0}
+    if fused_counts["qkv"] or fused_counts["up_gate"]:
+        print(
+            "Fused W4A16 Marlin projections: "
+            f"qkv={fused_counts['qkv']}, up_gate={fused_counts['up_gate']}."
+        )
+
     model.flatquant_runtime = runtime_name
     model.flatquant_runtime_dtype = str(model_dtype).removeprefix("torch.")
     model.flatquant_kernel_dtype = str(kernel_dtype).removeprefix("torch.")
+    model.flatquant_fused_qkv_layers = fused_counts["qkv"]
+    model.flatquant_fused_up_gate_layers = fused_counts["up_gate"]
     return model
 
 

@@ -51,8 +51,15 @@ class FlatQuantExaone45MLP(nn.Module):
 
     def _trans_forward(self, x):
         x_ts = self.up_gate_trans(x) if self.up_gate_trans is not None else x
-        gate_states = self.gate_proj(x_ts, qa_trans=self.up_gate_trans)
-        up_states = self.up_proj(x_ts, qa_trans=self.up_gate_trans)
+        fused_up_gate_proj = getattr(self, "fused_up_gate_proj", None)
+        if fused_up_gate_proj is not None and self.gate_proj._eval_mode and self.up_proj._eval_mode:
+            gate_states, up_states = fused_up_gate_proj(x_ts).split(
+                [self.gate_proj.linear.out_features, self.up_proj.linear.out_features],
+                dim=-1,
+            )
+        else:
+            gate_states = self.gate_proj(x_ts, qa_trans=self.up_gate_trans)
+            up_states = self.up_proj(x_ts, qa_trans=self.up_gate_trans)
         x = self.act_fn(gate_states) * up_states
         x_ts = self.down_trans(x) if self.down_trans is not None else x
         return self.down_proj(x_ts, qa_trans=self.down_trans)
@@ -153,6 +160,14 @@ class FlatQuantExaone45Attention(nn.Module):
             return query_states, key_states, value_states
 
         hidden_states_ts = self.qkv_trans(hidden_states) if self.qkv_trans is not None else hidden_states
+        fused_qkv_proj = getattr(self, "fused_qkv_proj", None)
+        if fused_qkv_proj is not None and self.q_proj._eval_mode and self.k_proj._eval_mode and self.v_proj._eval_mode:
+            qkv_states = fused_qkv_proj(hidden_states_ts)
+            return qkv_states.split(
+                [self.q_proj.linear.out_features, self.k_proj.linear.out_features, self.v_proj.linear.out_features],
+                dim=-1,
+            )
+
         query_states = self.q_proj(hidden_states_ts, qa_trans=self.qkv_trans)
         key_states = self.k_proj(hidden_states_ts, qa_trans=self.qkv_trans)
         if self.args.separate_vtrans:
