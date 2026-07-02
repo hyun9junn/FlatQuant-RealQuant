@@ -115,6 +115,118 @@ python main.py \
   --exp_name exaone45-33b-w4a16-e15-lr5e3-visfq
 ```
 
+## Run through vLLM (`--engine vllm`)
+
+The `ppl`, `latency`, and `eval` (text + vlm) benchmarks accept `--engine vllm`
+to run inference through vLLM instead of the custom FlatQuant Transformers
+runtime. Use it to validate and benchmark the W4A16 vLLM deployment path.
+
+**Environment.** Run vLLM benchmarks from the `flatquant-vllm` venv (it has
+vllm + the FlatQuant plugin + lm-eval). The default `--engine hf` path still
+uses the `flatquant-exaone` venv.
+
+```bash
+source /workspace/.venvs/flatquant-vllm/bin/activate
+export PYTHONPATH=/workspace/FlatQuant:$PYTHONPATH
+```
+
+**Model scope.** `--engine vllm` supports BF16, AWQ, and **weight-only
+FlatQuant W4A16**. Point `--flatquant_model_paths` at a W4A16 vLLM export
+produced by `tools/export_flatquant_vllm.py` (its `config.json` must carry
+`quantization_config.quant_method = "flatquant"`, which the
+`flatquant_vllm_plugin` registers as a vLLM quant method). FlatQuant **W4A4**
+(activation quantization) has no vLLM path — run it with `--engine hf`.
+
+**vLLM-only options:** `--gpu_memory_utilization`, `--max_model_len`,
+`--tensor_parallel_size`, and `--enforce_eager` (disable torch.compile + CUDA
+graphs; omit it to benchmark the CUDA-graph path).
+
+`W4A16` below is shorthand for
+`outputs/EXAONE-4.5-33B/w4a16-vllm/exaone45-33b-w4a16-vllm` and `AWQ_PATH` for
+the AWQ snapshot dir.
+
+### PPL (vLLM)
+
+Perplexity is computed from vLLM prompt logprobs, matching the HF `ppl_eval`
+arithmetic (mean per-token cross-entropy over `seqlen` blocks).
+
+```bash
+python benchmarks/benchmark_exaone45.py ppl \
+  --models bf16 awq flatquant \
+  --awq_model_path AWQ_PATH \
+  --flatquant_model_paths W4A16 \
+  --flatquant_labels FlatQuant-W4A16 \
+  --engine vllm \
+  --datasets wikitext2 c4 --seqlen 2048 --max_samples 100000
+```
+
+### Latency (vLLM)
+
+Prefill / decode / e2e throughput via batched `LLM.generate` (decode forced
+with `min_tokens`). Non-eager captures CUDA graphs; add `--enforce_eager` for
+the eager baseline.
+
+```bash
+python benchmarks/benchmark_exaone45.py latency \
+  --models flatquant \
+  --flatquant_model_paths W4A16 \
+  --flatquant_labels FlatQuant-W4A16 \
+  --engine vllm \
+  --batch_size 1 --prefill_seq_len 2048 --decode_steps 256 \
+  --warmup_steps 2 --num_repeats 10
+```
+
+### Text Eval (vLLM)
+
+Uses lm-eval's native `vllm` backend.
+
+```bash
+python benchmarks/benchmark_exaone45.py eval \
+  --models awq flatquant \
+  --awq_model_path AWQ_PATH \
+  --flatquant_model_paths W4A16 \
+  --flatquant_labels FlatQuant-W4A16 \
+  --engine vllm \
+  --tasks mmlu-pro --num_fewshot 5 --batch_size 8 --max_length 4096 --limit 100
+```
+
+### VLM Eval (vLLM)
+
+Uses lmms-eval's native `vllm` backend (EXAONE-4.5 loads as
+`Exaone4_5_ForConditionalGeneration`). Install it into the flatquant-vllm venv
+(`decord` is required by the lmms vllm backend):
+
+```bash
+uv pip install --python /workspace/.venvs/flatquant-vllm/bin/python \
+  "git+https://github.com/EvolvingLMMs-Lab/lmms-eval.git" \
+  latex2sympy2_extended Levenshtein decord
+```
+
+lmms-eval ships many task include files **without a `.yaml` extension** that pip
+does not package; `TaskManager` scans every task at startup and crashes on the
+first missing one. Restore the full set from an upstream clone (re-run after any
+lmms-eval reinstall):
+
+```bash
+TASKS_DIR="$(python -c 'import os,lmms_eval;print(os.path.join(os.path.dirname(lmms_eval.__file__),"tasks"))')"
+git clone --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git /tmp/lmms-eval-src
+SRC=/tmp/lmms-eval-src/lmms_eval/tasks
+find "$SRC" -type f | while read -r f; do
+  rel="${f#$SRC/}"
+  [ -e "$TASKS_DIR/$rel" ] || { mkdir -p "$TASKS_DIR/$(dirname "$rel")"; cp "$f" "$TASKS_DIR/$rel"; }
+done
+```
+
+```bash
+python benchmarks/benchmark_exaone45.py eval \
+  --models awq flatquant \
+  --awq_model_path AWQ_PATH \
+  --flatquant_model_paths W4A16 \
+  --flatquant_labels FlatQuant-W4A16 \
+  --engine vllm \
+  --tasks mmmu_pro --batch_size 1 --max_new_tokens 128
+```
+
 ## Compare PPL
 
 ```bash
@@ -168,16 +280,15 @@ python benchmarks/benchmark_exaone45.py eval \
 
 ```bash
 python benchmarks/benchmark_exaone45.py eval \
-  --models bf16 awq flatquant \
+  --models awq flatquant \
   --awq_model_path /workspace/.hf_home/hub/models--LGAI-EXAONE--EXAONE-4.5-33B-AWQ/snapshots/d73d64aa670777f94f101916ea0803e033ba9b59 \
   --flatquant_model_paths ./outputs/EXAONE-4.5-33B/w4a4/exaone45-33b-w4a4-e15-lr5e3-ppl \
     ./outputs/EXAONE-4.5-33B/w4a16/exaone45-33b-w4a16-e15-lr5e3 \
   --flatquant_labels FlatQuant-W4A4 FlatQuant-W4A16 \
   --flatquant_dtype bfloat16 \
-  --tasks mmlu_abstract_algebra \
+  --tasks mmlu-pro \
   --num_fewshot 5 \
-  --limit 10 \
-  --batch_size 1 \
+  --batch_size 8 \
   --max_length 4096 \
   --attn_implementation sdpa
 ```
@@ -186,6 +297,24 @@ python benchmarks/benchmark_exaone45.py eval \
 
 ```bash
 uv pip install git+https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+uv pip install latex2sympy2_extended Levenshtein
+```
+
+### Fix missing salbench include files (lmms-eval packaging bug)
+
+`lmms-eval`'s `salbench` task includes two base configs that are stored **without a
+`.yaml` extension** upstream (`_o3_default`, `_p3_default`). pip only packages
+`*.yaml`, so these files are missing after install, and `TaskManager` — which scans
+**every** task at startup — crashes with
+`FileNotFoundError: .../lmms_eval/tasks/salbench/_o3_default` before any of the tasks
+below can run. Restore them from upstream (re-run this after any `lmms-eval` reinstall):
+
+```bash
+SALBENCH_DIR="$(python -c 'import os, lmms_eval; print(os.path.join(os.path.dirname(lmms_eval.__file__), "tasks", "salbench"))')"
+BASE_URL="https://raw.githubusercontent.com/EvolvingLMMs-Lab/lmms-eval/main/lmms_eval/tasks/salbench"
+for f in _o3_default _p3_default; do
+  curl -fsSL "$BASE_URL/$f" -o "$SALBENCH_DIR/$f"
+done
 ```
 
 ```bash
@@ -196,9 +325,8 @@ python benchmarks/benchmark_exaone45.py eval \
     ./outputs/EXAONE-4.5-33B/w4a16/exaone45-33b-w4a16-e15-lr5e3 \
   --flatquant_labels FlatQuant-W4A4 FlatQuant-W4A16 \
   --flatquant_dtype bfloat16 \
-  --tasks mmmu_val mmmu_pro mathvista_testmini mathvision_testmini wemath logicvista charxiv \
+  --tasks mmmu_pro \
   --batch_size 1 \
-  --limit 10 \
   --max_new_tokens 128 \
   --attn_implementation sdpa
 ```

@@ -13,10 +13,14 @@ try:
 except ImportError:
     import common
 
-from deploy.transformers.modeling_exaone4_5 import FlatQuantExaone45ForConditionalGeneration
 from transformers.models.exaone4_5.modeling_exaone4_5 import (
     Exaone4_5_ForConditionalGeneration,
 )
+
+try:
+    from benchmarks.exaone45 import vllm_common
+except ImportError:
+    import vllm_common
 
 
 DEFAULT_FLATQUANT_PATH = (
@@ -117,6 +121,10 @@ def _random_input(model, batch_size, seq_len):
 
 
 def _load_flatquant_model(model_path, device, attn_implementation):
+    from deploy.transformers.modeling_exaone4_5 import (
+        FlatQuantExaone45ForConditionalGeneration,
+    )
+
     model = FlatQuantExaone45ForConditionalGeneration.from_pretrained(
         model_path, attn_implementation=attn_implementation
     )
@@ -470,7 +478,124 @@ def _latency_summary_row(result):
     return row
 
 
+def _measure_vllm_generate(llm, prompt_token_ids, max_tokens, num_repeats):
+    """Time ``num_repeats`` batched generations, returning per-run seconds."""
+    from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    params = SamplingParams(
+        temperature=0.0,
+        max_tokens=max_tokens,
+        min_tokens=max_tokens,
+        ignore_eos=True,
+    )
+    prompts = [TokensPrompt(prompt_token_ids=list(ids)) for ids in prompt_token_ids]
+    times = []
+    for _ in range(num_repeats):
+        start = time.perf_counter()
+        llm.generate(prompts, params, use_tqdm=False)
+        times.append(time.perf_counter() - start)
+    return times
+
+
+def _run_latency_vllm(args):
+    import numpy as np
+
+    specs = common.build_model_specs(args, default_models=None)
+    output_dir = None
+    if len(specs) > 1 or args.output_dir:
+        output_dir = Path(
+            args.output_dir
+            or Path("./outputs/latency_results") / time.strftime("vllm_compare_%Y%m%d_%H%M%S")
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    stages = set(args.stages)
+    results = []
+    for spec in specs:
+        print(f"\n=== Latency (vLLM): {spec.label} ===")
+        llm = vllm_common.build_llm(spec, args)
+        try:
+            tokenizer = llm.get_tokenizer()
+            vocab = getattr(tokenizer, "vocab_size", None) or 32000
+            rng = np.random.default_rng(0)
+            prompt_ids = rng.integers(
+                low=10, high=max(11, vocab - 1),
+                size=(args.batch_size, args.prefill_seq_len),
+            ).tolist()
+
+            # Warmup (compile + CUDA-graph capture happen here for non-eager).
+            for _ in range(max(1, args.warmup_steps)):
+                _measure_vllm_generate(llm, prompt_ids, args.decode_steps or 1, 1)
+
+            prefill_times = _measure_vllm_generate(llm, prompt_ids, 1, args.num_repeats)
+            result = {}
+            if "prefill" in stages:
+                result["prefill"] = _stage_summary(
+                    [t * 1000 for t in prefill_times], [None], args.batch_size,
+                    token_count=args.prefill_seq_len,
+                )
+            if args.decode_steps > 0 and ({"decode", "e2e"} & stages):
+                e2e_times = _measure_vllm_generate(
+                    llm, prompt_ids, args.decode_steps, args.num_repeats
+                )
+                if "e2e" in stages:
+                    result["e2e"] = _stage_summary(
+                        [t * 1000 for t in e2e_times], [None], args.batch_size,
+                        token_count=args.prefill_seq_len + args.decode_steps,
+                    )
+                if "decode" in stages:
+                    decode_times = [
+                        max(e - p, 1e-6) for e, p in zip(e2e_times, prefill_times)
+                    ]
+                    result["decode"] = _stage_summary(
+                        [t * 1000 for t in decode_times], [None], args.batch_size,
+                        token_count=args.decode_steps, step_count=args.decode_steps,
+                    )
+
+            result.update(
+                {
+                    "label": spec.label,
+                    "model_path": spec.path,
+                    "model_kind": common.resolve_model_kind(spec.path, spec.kind),
+                    "engine": "vllm",
+                    "batch_size": args.batch_size,
+                    "prefill_seq_len": args.prefill_seq_len,
+                    "decode_steps": args.decode_steps,
+                    "warmup_steps": args.warmup_steps,
+                    "num_repeats": args.num_repeats,
+                    "stages": args.stages,
+                    "dtype": spec.dtype,
+                    "enforce_eager": args.enforce_eager,
+                }
+            )
+            print_summary(result)
+            print(json.dumps(result, indent=2, sort_keys=True))
+            output_path = (
+                Path(output_dir) / f"{common.safe_name(spec.label)}_vllm_latency.json"
+                if output_dir
+                else (Path(args.output_path) if args.output_path else None)
+            )
+            if output_path is not None:
+                common.write_json(output_path, result)
+                print(f"Saved results to {output_path}")
+            results.append(result)
+        finally:
+            del llm
+            common.cleanup(args.device)
+
+    if len(results) > 1:
+        rows = [_latency_summary_row(result) for result in results]
+        columns = ["model", "prefill_tok_s", "decode_ms_step", "decode_tok_s", "e2e_ms", "peak_gb"]
+        common.print_comparison_table(rows, columns)
+        if output_dir:
+            common.write_json(Path(output_dir) / "summary.json", {"models": results})
+    return results
+
+
 def _run_latency_comparison(args):
+    if getattr(args, "engine", "hf") == "vllm":
+        return _run_latency_vllm(args)
     specs = common.build_model_specs(args, default_models=None)
     multi_model = len(specs) > 1
     output_dir = None
@@ -560,6 +685,8 @@ def main():
     )
     parser.add_argument("--output_path", default=None)
     parser.add_argument("--output_dir", default=None)
+    parser.add_argument("--tensor_parallel_size", type=int, default=1)
+    vllm_common.add_engine_arg(parser)
     args = parser.parse_args()
 
     _run_latency_comparison(args)

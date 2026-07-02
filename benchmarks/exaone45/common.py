@@ -21,11 +21,38 @@ try:
 except ImportError:
     from transformers.initialization import no_init_weights
 
-from deploy.nn import LinearW4A16, LinearW4A16Marlin, is_marlin_available
-from deploy.transformers.modeling_exaone4_5 import FlatQuantExaone45ForConditionalGeneration
 from transformers.models.exaone4_5.modeling_exaone4_5 import (
     Exaone4_5_ForConditionalGeneration,
 )
+
+# The FlatQuant HF runtime depends on compiled kernels (deploy.nn ->
+# fast_hadamard_transform) that only exist in the exaone venv. The vLLM engine
+# path (--engine vllm) never touches them, so import them lazily to keep this
+# module importable in the flatquant-vllm venv.
+LinearW4A16 = None
+LinearW4A16Marlin = None
+is_marlin_available = None
+FlatQuantExaone45ForConditionalGeneration = None
+
+
+def _ensure_flatquant_runtime():
+    """Import the compiled FlatQuant HF runtime symbols on first use."""
+    global LinearW4A16, LinearW4A16Marlin, is_marlin_available
+    global FlatQuantExaone45ForConditionalGeneration
+    if LinearW4A16 is not None:
+        return
+    from deploy.nn import (
+        LinearW4A16 as _LinearW4A16,
+        LinearW4A16Marlin as _LinearW4A16Marlin,
+        is_marlin_available as _is_marlin_available,
+    )
+    from deploy.transformers.modeling_exaone4_5 import (
+        FlatQuantExaone45ForConditionalGeneration as _FlatQuantModel,
+    )
+    LinearW4A16 = _LinearW4A16
+    LinearW4A16Marlin = _LinearW4A16Marlin
+    is_marlin_available = _is_marlin_available
+    FlatQuantExaone45ForConditionalGeneration = _FlatQuantModel
 
 
 DEFAULT_BF16_MODEL = "LGAI-EXAONE/EXAONE-4.5-33B"
@@ -425,6 +452,7 @@ def _is_runtime_state_key(key):
 
 
 def load_flatquant_weight_only_model(model_path, device, dtype, hf_token=None, attn_implementation="eager"):
+    _ensure_flatquant_runtime()
     from flatquant.model_tools.exaone45_utils import apply_flatquant_to_exaone45
 
     model_path = Path(model_path)
@@ -570,6 +598,7 @@ def resolve_flatquant_eval_mode(model_path, requested_mode):
 
 
 def load_flatquant_model(model_path, device, dtype="bfloat16", hf_token=None, eval_mode="auto", attn_implementation="eager"):
+    _ensure_flatquant_runtime()
     eval_mode = resolve_flatquant_eval_mode(model_path, eval_mode)
     if eval_mode == "weight_only":
         model = load_flatquant_weight_only_model(

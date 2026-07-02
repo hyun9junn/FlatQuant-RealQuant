@@ -14,9 +14,10 @@ from tqdm import tqdm
 
 import flatquant.data_utils as data_utils
 try:
-    from benchmarks.exaone45 import common
+    from benchmarks.exaone45 import common, vllm_common
 except ImportError:
     import common
+    import vllm_common
 
 
 def _default_output_path(model_path, dataset, nsamples):
@@ -167,7 +168,125 @@ def _run_ppl_for_spec(args, spec, datasets, output_path=None, output_dir=None):
         common.cleanup(args.device)
 
 
+def _ppl_from_vllm(llm, testenc, seqlen, max_samples, chunk=32):
+    """Perplexity from vLLM prompt logprobs, matching ppl_eval's arithmetic.
+
+    For each non-overlapping ``seqlen`` block we sum the negative log-prob of
+    every token given its prefix and divide by ``seqlen - 1`` to get the block's
+    mean cross-entropy; the reported PPL is ``exp(mean over blocks)``.
+    """
+    import math
+
+    from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    ids = testenc.input_ids.reshape(-1).tolist()
+    nsamples = len(ids) // seqlen
+    if max_samples is not None:
+        nsamples = min(nsamples, max_samples)
+    if nsamples <= 0:
+        raise ValueError("No PPL samples available for the requested seqlen/max_samples.")
+
+    blocks = [ids[i * seqlen : (i + 1) * seqlen] for i in range(nsamples)]
+    params = SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=1)
+
+    ce_means = []
+    times_ms = []
+    for start in tqdm(range(0, nsamples, chunk), desc="PPL blocks (vLLM)"):
+        batch = blocks[start : start + chunk]
+        prompts = [TokensPrompt(prompt_token_ids=block) for block in batch]
+        t0 = time.perf_counter()
+        outputs = llm.generate(prompts, params, use_tqdm=False)
+        times_ms.append((time.perf_counter() - t0) * 1000 / len(batch))
+        for output, block in zip(outputs, batch):
+            prompt_logprobs = output.prompt_logprobs
+            nll = 0.0
+            for pos in range(1, seqlen):
+                nll -= prompt_logprobs[pos][block[pos]].logprob
+            ce_means.append(nll / (seqlen - 1))
+
+    ppl = math.exp(sum(ce_means) / len(ce_means))
+    return {
+        "ppl": float(ppl),
+        "nsamples": int(nsamples),
+        "seqlen": int(seqlen),
+        "avg_time_ms": float(np.mean(times_ms)),
+        "std_time_ms": float(np.std(times_ms)),
+    }
+
+
+def _run_ppl_vllm(args):
+    specs = common.build_model_specs(args, default_models=None)
+    datasets = common.dedupe_preserve_order(
+        common.flatten_values(getattr(args, "datasets", None)) or [args.dataset]
+    )
+    output_dir = None
+    if len(specs) > 1 or len(datasets) > 1 or args.output_dir:
+        output_dir = Path(
+            args.output_dir
+            or Path("./outputs/ppl_results") / time.strftime("vllm_compare_%Y%m%d_%H%M%S")
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    all_results = []
+    for spec in specs:
+        tokenizer_name = spec.tokenizer or args.tokenizer or common.infer_tokenizer_name(spec.path)
+        tokenizer = common.load_tokenizer(tokenizer_name, args.hf_token)
+        print(f"\n=== PPL (vLLM): {spec.label} ===")
+        llm = vllm_common.build_llm(spec, args)
+        try:
+            for dataset in datasets:
+                print(f"\n--- PPL dataset: {dataset} ({spec.label}) ---")
+                testenc = data_utils.get_loaders(
+                    argparse.Namespace(), dataset, tokenizer,
+                    seqlen=args.seqlen, eval_mode=True,
+                )
+                result = _ppl_from_vllm(llm, testenc, args.seqlen, args.max_samples)
+                result.update(
+                    {
+                        "label": spec.label,
+                        "dataset": dataset,
+                        "engine": "vllm",
+                        "model_kind": common.resolve_model_kind(spec.path, spec.kind),
+                        "model_path": spec.path,
+                        "dtype": spec.dtype,
+                        "tokenizer": tokenizer_name,
+                    }
+                )
+                if output_dir is not None:
+                    output_path = Path(output_dir) / f"{common.safe_name(spec.label)}_{dataset}_ppl.json"
+                elif args.output_path:
+                    output_path = Path(args.output_path)
+                else:
+                    output_path = _default_output_path(spec.path, dataset, result["nsamples"])
+                common.write_json(output_path, result)
+                print(json.dumps(result, indent=2, sort_keys=True))
+                print(f"Saved results to {output_path}")
+                all_results.append(result)
+        finally:
+            del llm
+            common.cleanup(args.device)
+
+    if len(all_results) > 1:
+        rows = [
+            {
+                "dataset": r["dataset"],
+                "model": r["label"],
+                "ppl": f"{r['ppl']:.4f}",
+                "avg_time_ms": f"{r['avg_time_ms']:.2f}",
+                "nsamples": r["nsamples"],
+            }
+            for r in all_results
+        ]
+        common.print_comparison_table(rows, ["dataset", "model", "ppl", "avg_time_ms", "nsamples"])
+        if output_dir:
+            common.write_json(Path(output_dir) / "summary.json", {"results": all_results})
+    return all_results
+
+
 def _run_ppl_comparison(args):
+    if getattr(args, "engine", "hf") == "vllm":
+        return _run_ppl_vllm(args)
     specs = common.build_model_specs(args, default_models=None)
     datasets = common.dedupe_preserve_order(common.flatten_values(getattr(args, "datasets", None)) or [args.dataset])
     multi_run = len(specs) > 1 or len(datasets) > 1
@@ -265,6 +384,8 @@ def main():
     parser.add_argument("--no_warmup", action="store_true")
     parser.add_argument("--output_path", default=None)
     parser.add_argument("--output_dir", default=None)
+    parser.add_argument("--tensor_parallel_size", type=int, default=1)
+    vllm_common.add_engine_arg(parser)
     args = parser.parse_args()
 
     torch.set_grad_enabled(False)

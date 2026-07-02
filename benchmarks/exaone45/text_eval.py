@@ -9,9 +9,10 @@ import torch
 import transformers
 
 try:
-    from benchmarks.exaone45 import common
+    from benchmarks.exaone45 import common, vllm_common
 except ImportError:
     import common
+    import vllm_common
 
 
 def _patch_lm_eval_text_imports():
@@ -257,6 +258,50 @@ def _run_lm_eval_for_spec(args, spec, tasks, output_path=None, output_dir=None):
             del tokenizer
         common.cleanup(args.device)
 
+def _run_lm_eval_vllm_for_spec(args, spec, tasks, output_path=None, output_dir=None):
+    import lm_eval
+    from lm_eval import utils as lm_eval_utils
+
+    print(f"\n=== LM Eval (vLLM): {spec.label} ===")
+    model_args = vllm_common.vllm_model_args(
+        spec, args, extra={"max_model_len": args.max_length}
+    )
+    results = lm_eval.simple_evaluate(
+        model="vllm",
+        model_args=model_args,
+        tasks=tasks,
+        num_fewshot=args.num_fewshot,
+        batch_size=args.batch_size,
+        limit=args.limit,
+        log_samples=args.log_samples,
+    )
+    print(lm_eval_utils.make_table(results))
+    summary = _metric_summary(results)
+    if summary:
+        print(json.dumps(summary, indent=2, sort_keys=True))
+
+    payload = {
+        "label": spec.label,
+        "engine": "vllm",
+        "model_kind": common.resolve_model_kind(spec.path, spec.kind),
+        "model_path": spec.path,
+        "dtype": spec.dtype,
+        "tasks": tasks,
+        "max_length": args.max_length,
+        "summary": summary,
+        "results": results,
+    }
+    if output_path is None:
+        if output_dir is not None:
+            output_path = Path(output_dir) / f"{common.safe_name(spec.label)}_lm_eval.json"
+        else:
+            output_path = _default_output_path(spec, tasks, args.limit)
+    common.write_json(output_path, payload)
+    print(f"Saved results to {output_path}")
+    common.cleanup(args.device)
+    return payload
+
+
 def _run_lm_eval_comparison(args):
     _patch_lm_eval_text_imports()
     _patch_transformers_vision2seq_alias()
@@ -264,15 +309,17 @@ def _run_lm_eval_comparison(args):
     tasks = _resolve_lm_eval_task_aliases(args.tasks)
     specs = common.build_model_specs(args, default_models=None)
     multi_model = bool(args.models)
+    use_vllm = getattr(args, "engine", "hf") == "vllm"
     output_dir = None
     if multi_model or args.output_dir:
         output_dir = Path(args.output_dir or Path("./outputs/lm_eval_results") / time.strftime("compare_%Y%m%d_%H%M%S"))
         output_dir.mkdir(parents=True, exist_ok=True)
 
+    runner = _run_lm_eval_vllm_for_spec if use_vllm else _run_lm_eval_for_spec
     payloads = []
     for spec in specs:
         payloads.append(
-            _run_lm_eval_for_spec(
+            runner(
                 args,
                 spec,
                 tasks,
@@ -342,6 +389,8 @@ def main():
     parser.add_argument("--log_samples", action="store_true")
     parser.add_argument("--output_path", default=None)
     parser.add_argument("--output_dir", default=None)
+    parser.add_argument("--tensor_parallel_size", type=int, default=1)
+    vllm_common.add_engine_arg(parser)
     args = parser.parse_args()
 
     torch.set_grad_enabled(False)

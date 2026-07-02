@@ -18,9 +18,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 try:
-    from benchmarks.exaone45 import common
+    from benchmarks.exaone45 import common, vllm_common
 except ImportError:
     import common
+    import vllm_common
 
 _infer_tokenizer_name = common.infer_tokenizer_name
 _load_tokenizer = common.load_tokenizer
@@ -835,6 +836,91 @@ def run_one_model(args, spec: ModelSpec, tasks: Sequence[str], output_dir: Path)
             del lm
         _cleanup(args.device)
 
+def _vllm_model_args_string(args, spec) -> str:
+    """Build the lmms-eval ``model_args`` string for the vLLM backend."""
+    dtype = vllm_common._vllm_dtype(spec)
+    parts = [
+        f"model={spec.path}",
+        "trust_remote_code=True",
+        f"gpu_memory_utilization={args.gpu_memory_utilization}",
+        f"max_model_len={args.max_model_len}",
+        f"max_new_tokens={args.max_new_tokens}",
+        f"dtype={dtype}",
+    ]
+    if args.max_pixels:
+        parts.append(f"max_pixels={args.max_pixels}")
+    if args.min_pixels:
+        parts.append(f"min_image_pixels={args.min_pixels}")
+    if getattr(args, "enforce_eager", False):
+        parts.append("enforce_eager=True")
+    return ",".join(parts)
+
+
+def run_one_model_vllm(args, spec: ModelSpec, tasks: Sequence[str], output_dir: Path) -> Dict[str, Any]:
+    evaluator, lmms_utils, lmms_base, TaskManager, GenerationResult, TokenCounts = _require_lmms_eval()
+    vllm_common.assert_vllm_supported(spec)
+
+    task_manager = TaskManager(args.verbosity, include_path=args.include_path, model_name="vllm")
+    matched_tasks = task_manager.match_tasks(list(tasks))
+    missing = [task for task in tasks if task not in matched_tasks and "*" not in task]
+    if missing:
+        raise ValueError(
+            f"Tasks were not found by lmms-eval: {', '.join(missing)}. "
+            "Run `python -m lmms_eval --tasks list` in the same env to check task names."
+        )
+
+    print(f"\n=== VLM Eval (vLLM): {spec.label} ===")
+    model_args = _vllm_model_args_string(args, spec)
+    print(f"lmms-eval vllm model_args: {model_args}")
+    seeds = _parse_seed(args.seed)
+    results = evaluator.simple_evaluate(
+        model="vllm",
+        model_args=model_args,
+        tasks=matched_tasks,
+        num_fewshot=args.num_fewshot,
+        batch_size=args.batch_size,
+        use_cache=args.response_cache,
+        limit=args.limit,
+        offset=args.offset,
+        log_samples=args.log_samples,
+        task_manager=task_manager,
+        verbosity=args.verbosity,
+        gen_kwargs=_gen_kwargs_arg(args),
+        predict_only=args.predict_only,
+        random_seed=seeds[0],
+        numpy_random_seed=seeds[1],
+        torch_random_seed=seeds[2],
+        fewshot_random_seed=seeds[3],
+        bootstrap_iters=args.bootstrap_iters,
+    )
+    if results is None:
+        raise RuntimeError("lmms-eval returned no results on this process.")
+
+    if "samples" in results and not args.keep_samples_in_model_json:
+        samples_path = output_dir / f"{_safe_name(spec.label)}_samples.json"
+        with open(samples_path, "w", encoding="utf-8") as f:
+            json.dump(results.pop("samples"), f, indent=2, default=_json_default)
+        print(f"Saved samples to {samples_path}")
+
+    summary = _metric_summary(results)
+    payload = {
+        "label": spec.label,
+        "key": spec.key,
+        "kind": common.resolve_model_kind(spec.path, spec.kind),
+        "path": spec.path,
+        "dtype": spec.dtype,
+        "engine": "vllm",
+        "summary": summary,
+        "results": results,
+    }
+    result_path = output_dir / f"{_safe_name(spec.label)}.json"
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, default=_json_default)
+    print(f"Saved {spec.label} results to {result_path}")
+    _cleanup(args.device)
+    return payload
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=(
@@ -945,6 +1031,9 @@ def main():
     output_group = parser.add_argument_group("output")
     output_group.add_argument("--output_dir", default=None)
 
+    parser.add_argument("--tensor_parallel_size", type=int, default=1)
+    vllm_common.add_engine_arg(parser)
+
     args = parser.parse_args()
 
     tasks = _resolve_tasks(args.tasks)
@@ -959,9 +1048,10 @@ def main():
     print(f"Tasks: {', '.join(tasks)}")
     print(f"Output dir: {output_dir}")
 
+    runner = run_one_model_vllm if getattr(args, "engine", "hf") == "vllm" else run_one_model
     all_results = []
     for spec in specs:
-        all_results.append(run_one_model(args, spec, tasks, output_dir))
+        all_results.append(runner(args, spec, tasks, output_dir))
 
     aggregate = {
         "tasks": tasks,
