@@ -1,4 +1,5 @@
 import argparse
+import ast
 import gc
 import json
 import os
@@ -10,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import transformers
+from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -219,17 +221,40 @@ def _metric_summary(results: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return summary
 
 
+def _summary_cell(summary: Dict[str, Any], task: str) -> str:
+    """Render a table cell for `task`.
+
+    lmms-eval groups (e.g. `mmmu_pro`, `mmmu_val`) carry no metric on the group
+    entry itself; the real scores live on subtask keys like `mmmu_pro_standard` /
+    `mmmu_pro_vision`. These are alternative input formats for the same examples,
+    so averaging them does not produce a meaningful benchmark score. Render each
+    subtask separately instead.
+    """
+    entry = summary.get(task)
+    if isinstance(entry, dict) and entry.get("value") is not None:
+        return f"{entry['value']:.2f}"
+
+    subs = [
+        (key, value)
+        for key, value in sorted(summary.items())
+        if key.startswith(f"{task}_") or key.startswith(f"{task}.")
+        if isinstance(value, dict) and value.get("value") is not None
+    ]
+    if not subs:
+        return ""
+    return " / ".join(
+        f"{key.removeprefix(f'{task}_').removeprefix(f'{task}.')}={value['value']:.2f}"
+        for key, value in subs
+    )
+
+
 def _print_comparison_table(rows: Sequence[Dict[str, Any]], tasks: Sequence[str]):
     headers = ["model"] + list(tasks)
     table = [headers]
     for row in rows:
         summary = row.get("summary", {})
         table.append(
-            [row["label"]]
-            + [
-                "" if task not in summary else f"{summary[task]['value']:.2f}"
-                for task in tasks
-            ]
+            [row["label"]] + [_summary_cell(summary, task) for task in tasks]
         )
 
     widths = [max(len(str(line[col])) for line in table) for col in range(len(headers))]
@@ -250,16 +275,50 @@ def _write_markdown_table(path: Path, rows: Sequence[Dict[str, Any]], tasks: Seq
         summary = row.get("summary", {})
         values = [
             row["label"],
-            *[
-                "" if task not in summary else f"{summary[task]['value']:.2f}"
-                for task in tasks
-            ],
+            *[_summary_cell(summary, task) for task in tasks],
         ]
         lines.append("| " + " | ".join(values) + " |")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _ensure_latex2sympy2():
+    """Make `import latex2sympy2` work for lmms-eval tasks (e.g. mathvision).
+
+    The standalone `latex2sympy2` 1.9.x wheel installs as a flat module that does
+    `from .gen.PSParser import ...` (a relative import that fails for a top-level
+    module), and it also pins an older antlr runtime that conflicts with
+    `latex2sympy2_extended` (required by `math_verify`). When the real package is
+    broken, alias the name to `latex2sympy2_extended.latex2sympy2`, which exposes a
+    compatible `latex2sympy` and is already antlr-compatible. Without this,
+    `mathvision/eval_utils.py` fails to import and `mathvision_process_results`
+    dies with `NameError: name 'is_number' is not defined`.
+    """
+    try:
+        import latex2sympy2  # noqa: F401
+
+        latex2sympy2.latex2sympy  # ensure it actually loaded
+        return
+    except Exception:
+        pass
+    try:
+        import latex2sympy2_extended.latex2sympy2 as _l2s_ext
+
+        sys.modules["latex2sympy2"] = _l2s_ext
+    except Exception:
+        # Leave it missing; the affected task will surface its own error.
+        pass
+
+
 def _require_lmms_eval():
+    # Some lmms-eval task modules (e.g. mmmu, mathvision) eagerly construct an
+    # OpenAI judge client at import time, which raises if OPENAI_API_KEY is unset
+    # even for tasks scored purely by rule-based matching. Inject a harmless
+    # placeholder so those imports succeed; no network call is made unless a task
+    # actually invokes the judge.
+    os.environ.setdefault("OPENAI_API_KEY", "flatquant-no-network")
+
+    _ensure_latex2sympy2()
+
     try:
         from lmms_eval import evaluator, utils as lmms_utils
         from lmms_eval.api.model import lmms
@@ -277,7 +336,41 @@ def _require_lmms_eval():
         TokenCounts = None
 
     _patch_lmms_eval_yaml_includes(lmms_utils)
+    _patch_mmmu_pro_vision_parser()
     return evaluator, lmms_utils, lmms, TaskManager, GenerationResult, TokenCounts
+
+
+def _patch_mmmu_pro_vision_parser() -> None:
+    """Parse option letters for MMMU-Pro Vision before exact-match scoring."""
+    try:
+        from lmms_eval.tasks.mmmu_pro import utils as mmmu_pro_utils
+    except (ImportError, ModuleNotFoundError):
+        return
+
+    original = mmmu_pro_utils.mmmu_pro_process_results
+    if getattr(original, "_flatquant_vision_parser_patch", False):
+        return
+
+    def process_results_with_vision_parser(doc, results):
+        if "question" in doc or "options" not in doc:
+            return original(doc, results)
+
+        pred = results[0]
+        options = ast.literal_eval(doc["options"])
+        index2ans, all_choices = mmmu_pro_utils.get_multi_choice_info(options)
+        parsed_pred = mmmu_pro_utils.parse_multi_choice_response(
+            pred, all_choices, index2ans
+        )
+        mmmu_acc = {
+            "id": doc["id"],
+            "subject": doc["subject"],
+            "answer": doc["answer"],
+            "parsed_pred": parsed_pred,
+        }
+        return {"mmmu_acc": mmmu_acc}
+
+    process_results_with_vision_parser._flatquant_vision_parser_patch = True
+    mmmu_pro_utils.mmmu_pro_process_results = process_results_with_vision_parser
 
 
 def _patch_lmms_eval_yaml_includes(lmms_utils) -> None:
@@ -300,9 +393,6 @@ def _patch_lmms_eval_yaml_includes(lmms_utils) -> None:
                             *args,
                             **kwargs,
                         )
-                    yaml_name = Path(yaml_path_str).name
-                    if yaml_name.startswith("_") or "_template_yaml" in yaml_name:
-                        return {}
             raise
 
     load_yaml_config_with_suffix_fallback._flatquant_include_patch = True
@@ -594,7 +684,13 @@ def _build_exaone_lmms_class(lmms_base, GenerationResult, TokenCounts):
 
         def generate_until(self, requests):
             results = []
-            for request in requests:
+            progress = tqdm(
+                requests,
+                total=len(requests),
+                disable=getattr(self, "rank", 0) != 0,
+                desc="Model Responding",
+            )
+            for request in progress:
                 messages, images, gen_kwargs, context = self._request_to_messages(request)
                 answer, output_tokens, rendered_prompt = self._generate_one(messages, images, gen_kwargs)
                 if hasattr(self, "cache_hook"):
